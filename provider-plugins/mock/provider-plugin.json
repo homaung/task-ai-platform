@@ -1,0 +1,37 @@
+{
+  "schemaVersion": "1.0",
+  "id": "dev.taskai.mock-provider",
+  "name": "Task AI Mock Provider",
+  "version": "1.0.0",
+  "vendor": "Task AI Platform",
+  "description": "Deterministic local provider used for acceptance tests.",
+  "entrypoint": "mock-provider.ps1",
+  "configurationSchema": {
+    "type": "object",
+    "properties": {
+      "responsePrefix": {
+        "type": "string",
+        "default": "Mock"
+      }
+    },
+    "additionalProperties": false
+  },
+  "credentialSchema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "capabilities": [
+    "chat",
+    "streaming",
+    "session_resume",
+    "structured_output",
+    "filesystem_read",
+    "filesystem_write",
+    "command_execution",
+    "code_edit",
+    "usage_reporting"
+  ],
+  "runtimeTypes": ["local_runtime", "cli"],
+  "permissions": []
+}

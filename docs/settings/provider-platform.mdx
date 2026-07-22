@@ -1,0 +1,137 @@
+---
+title: "Configure provider plugins and task assignments"
+description: "Install provider-independent AI plugins, register execution resources, validate capabilities, and start task sessions."
+---
+
+The provider platform lets you connect any AI implementation without adding a
+provider name to the application core. You combine a plugin, account, model,
+runtime, agent profile, and permission policy in a task assignment.
+
+<Info>
+  The original Vibe Kanban coding-agent executors remain available as a legacy
+  compatibility layer. New integrations use the provider plugin contract.
+</Info>
+
+## Resource hierarchy
+
+Configure resources in this order:
+
+1. **Provider plugin** — defines the protocol adapter, capabilities, runtime
+   types, and requested permissions.
+2. **Provider account** — represents a credential reference or connection.
+3. **Model definition** — describes a model exposed by the connection.
+4. **Runtime profile** — identifies where and how the adapter runs.
+5. **Permission policy** — records the permissions you approve.
+6. **Agent profile** — defines a reusable role and behavioural instructions.
+7. **Task assignment** — combines the resources for one task.
+
+## Install a plugin
+
+<Steps>
+<Step title="Open the AI Provider settings">
+  Open **Settings**, then select **AI Providers**.
+</Step>
+
+<Step title="Select a plugin directory">
+  Enter the absolute path to a directory containing `provider-plugin.json` and
+  the manifest entrypoint.
+
+The repository includes a deterministic acceptance-test plugin at:
+
+```text
+C:\AI-Workspace\task-ai-platform\provider-plugins\mock
+```
+
+</Step>
+
+<Step title="Review and install">
+  Select **Install**. The platform validates the manifest, rejects entrypoints
+  outside the plugin directory, and records the declared capabilities and
+  permissions.
+
+  <Check>
+  The installed plugin appears with its free-form plugin key and capability
+  badges.
+  </Check>
+</Step>
+</Steps>
+
+## Create an assignment
+
+Use the forms in **AI Providers** to create an account, model, runtime,
+permission policy, and agent profile. The assignment wizard filters accounts by
+plugin and filters models and runtimes by account.
+
+Enter the task's required capabilities as comma-separated identifiers, then
+select **Capability validation**.
+
+<Warning>
+  The platform prevents assignment creation when a capability is missing, a
+  plugin permission is not explicitly approved, selected resources do not belong
+  to the same hierarchy, or a selected resource is disabled.
+</Warning>
+
+## Start a session
+
+Select **Start session** on a saved assignment. The platform starts the plugin
+entrypoint in a separate process and sends one newline-delimited JSON request.
+It applies a 30-second timeout and a 1 MiB response limit.
+
+Provider-specific identifiers remain in the following generic fields:
+
+- `provider_session_reference`
+- `provider_thread_reference`
+- `external_session_reference`
+- `provider_metadata_json`
+
+The core schema does not add provider-specific columns.
+
+## Plugin manifest
+
+Each plugin directory contains `provider-plugin.json`.
+
+```json provider-plugin.json
+{
+  "schemaVersion": "1.0",
+  "id": "dev.example.custom-agent",
+  "name": "Custom Agent",
+  "version": "1.0.0",
+  "entrypoint": "bin/custom-agent",
+  "configurationSchema": {
+    "type": "object",
+    "additionalProperties": false
+  },
+  "credentialSchema": {
+    "type": "object",
+    "additionalProperties": false
+  },
+  "capabilities": ["chat", "streaming"],
+  "runtimeTypes": ["local_runtime"],
+  "permissions": []
+}
+```
+
+The entrypoint receives `--provider-plugin-rpc`, reads a JSON request from
+standard input, and writes one JSON response to standard output. Return either
+`result` or `error` with the same request `id`.
+
+```json Response
+{
+  "id": "session-request-id",
+  "result": {
+    "providerSessionReference": "custom-session-42",
+    "providerThreadReference": "custom-thread-42",
+    "metadata": {
+      "region": "local"
+    }
+  }
+}
+```
+
+## Security boundary
+
+The plugin host enforces manifest validation, path containment, explicit
+permission approval, process separation, timeout limits, and response-size
+limits. This initial host does not yet provide an operating-system sandbox.
+Only install plugins whose code you trust, and approve the minimum required
+permissions.
