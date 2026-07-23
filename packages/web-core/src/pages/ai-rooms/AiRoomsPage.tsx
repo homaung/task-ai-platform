@@ -88,6 +88,11 @@ export function AiRoomsPage() {
     useState<DocumentKind>('context');
   const [draft, setDraft] = useState('');
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
+  const [selectedLibraryFile, setSelectedLibraryFile] = useState<string | null>(
+    null
+  );
+  const [libraryDraft, setLibraryDraft] = useState('');
+  const [sidePanel, setSidePanel] = useState<'library' | 'sessions'>('library');
   const [showCreate, setShowCreate] = useState(false);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -228,6 +233,27 @@ export function AiRoomsPage() {
     }
   };
 
+  const importRemoteDocuments = async () => {
+    if (!selectedRoomId) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await aiRoomsApi.importRemoteDocuments(selectedRoomId);
+      setSnapshot(result.snapshot);
+      setSidePanel('library');
+      setNotice(
+        result.conflicts.length
+          ? `${result.copied_to_local.length}개 문서를 가져왔고 ${result.conflicts.length}개 이름 충돌은 보존했습니다.`
+          : `${result.copied_to_local.length}개 서버 문서를 룸 문서로 가져왔습니다. 서버 원본은 유지됩니다.`
+      );
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const prepareRemote = async () => {
     if (!selectedRoomId) return;
     setBusy(true);
@@ -256,6 +282,85 @@ export function AiRoomsPage() {
       );
       setSnapshot(next);
       setNotice('공용 문서를 로컬 프로젝트에 저장했습니다.');
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const createLibraryFile = async () => {
+    if (!selectedRoomId || !snapshot) return;
+    const requested = window.prompt(
+      '새 룸 문서 이름을 입력하세요. 예: review-checklist.md'
+    );
+    if (!requested?.trim()) return;
+    const filename = requested.trim().endsWith('.md')
+      ? requested.trim()
+      : `${requested.trim()}.md`;
+    const existing = snapshot.library.find(
+      (file) => file.filename === `library/${filename}`
+    );
+    if (existing) {
+      setSelectedLibraryFile(existing.filename);
+      setSidePanel('library');
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    try {
+      const title = filename
+        .replace(/\.md$/i, '')
+        .replace(/[-_]+/g, ' ')
+        .trim();
+      const next = await aiRoomsApi.updateLibraryFile(
+        selectedRoomId,
+        filename,
+        `# ${title}\n\n## 목적\n\n## 사용 시점\n\n## 절차\n\n`
+      );
+      setSnapshot(next);
+      setSelectedLibraryFile(`library/${filename}`);
+      setSidePanel('library');
+      setNotice('새 룸 문서를 만들었습니다.');
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveLibraryFile = async () => {
+    if (!selectedRoomId || !activeLibrary) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await aiRoomsApi.updateLibraryFile(
+        selectedRoomId,
+        activeLibrary.filename.replace('library/', ''),
+        libraryDraft
+      );
+      setSnapshot(next);
+      setNotice('룸 문서를 로컬 프로젝트에 저장했습니다.');
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteLibraryFile = async () => {
+    if (!selectedRoomId || !activeLibrary) return;
+    const filename = activeLibrary.filename.replace('library/', '');
+    if (!window.confirm(`'${filename}' 룸 문서를 삭제할까요?`)) return;
+
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await aiRoomsApi.deleteLibraryFile(selectedRoomId, filename);
+      setSnapshot(next);
+      setSelectedLibraryFile(next.library[0]?.filename ?? null);
+      setNotice(`'${filename}' 룸 문서를 삭제했습니다.`);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -292,6 +397,17 @@ export function AiRoomsPage() {
       ) ?? snapshot?.sessions[0],
     [selectedSession, snapshot]
   );
+
+  const activeLibrary = useMemo(
+    () =>
+      snapshot?.library.find((file) => file.filename === selectedLibraryFile) ??
+      snapshot?.library[0],
+    [selectedLibraryFile, snapshot]
+  );
+
+  useEffect(() => {
+    setLibraryDraft(activeLibrary?.content ?? '');
+  }, [activeLibrary]);
 
   return (
     <div className="flex h-full min-h-0 bg-primary text-normal">
@@ -435,9 +551,9 @@ export function AiRoomsPage() {
                 </label>
               </div>
               <div className="rounded-md bg-primary p-3 text-xs leading-5 text-low">
-                생성하면 로컬 프로젝트에 <code>.ai-room</code> 설명서와 세션
-                폴더를 만듭니다. 서버는 작업을 시작할 때만 임시로 준비하며,
-                동기화 뒤 서버 기록을 삭제합니다.
+                생성하면 로컬 프로젝트에 <code>.ai-room</code> 설명서, 룸 문서
+                보관함, 세션 폴더를 만듭니다. 서버는 작업을 시작할 때만 임시로
+                준비하며, 동기화 뒤 서버 기록을 삭제합니다.
               </div>
               <div className="flex justify-end gap-2">
                 <button
@@ -551,9 +667,12 @@ export function AiRoomsPage() {
                     바로 실행하세요. 서버에서 작업할 때는 먼저{' '}
                     <strong>서버 작업 준비</strong>을 누른 뒤 서버 프로젝트
                     루트에서 실행합니다. 작업이 끝나 세션 기록이 생기면 앱이
-                    자동으로 로컬에 보관하고 서버의 임시 <code>.ai-room</code>{' '}
-                    파일과 관리 안내를 삭제합니다. <strong>지금 동기화</strong>
-                    는 복구가 필요할 때만 사용하세요.
+                    자동으로 로컬에 보관합니다. AI에게 작업 방식, 규칙, 절차를
+                    룸에 저장하라고 하면 <code>.ai-room/library</code>에 문서로
+                    남고 오른쪽의 <strong>룸 문서</strong> 목록에 나타납니다.
+                    동기화가 끝나면 서버의 임시 <code>.ai-room</code> 파일과
+                    관리 안내를 삭제합니다. <strong>지금 동기화</strong>는
+                    복구가 필요할 때만 사용하세요.
                   </p>
                 </div>
               </div>
@@ -598,47 +717,157 @@ export function AiRoomsPage() {
               </section>
 
               <section className="flex min-h-0 flex-col rounded-lg border border-border bg-secondary">
-                <div className="flex items-center justify-between border-b border-border p-4">
-                  <div className="flex items-center gap-2">
-                    <FileTextIcon className="h-5 w-5" />
-                    <h3 className="font-medium text-high">세션 기록</h3>
-                  </div>
-                  <span className="text-xs text-low">
-                    {snapshot.sessions.length}개
-                  </span>
-                </div>
-                <div className="max-h-48 overflow-y-auto border-b border-border p-2">
-                  {snapshot.sessions.map((session) => (
+                <div className="flex items-center justify-between gap-2 border-b border-border p-3">
+                  <div className="flex gap-1">
                     <button
-                      key={session.filename}
-                      onClick={() => setSelectedSession(session.filename)}
+                      type="button"
+                      onClick={() => setSidePanel('library')}
                       className={cn(
-                        'mb-1 w-full rounded-md p-2 text-left',
-                        activeSession?.filename === session.filename
-                          ? 'bg-primary'
-                          : 'hover:bg-primary/60'
+                        'rounded-md px-3 py-2 text-sm',
+                        sidePanel === 'library'
+                          ? 'bg-primary text-high'
+                          : 'text-low hover:text-high'
                       )}
                     >
-                      <p className="truncate font-mono text-xs text-high">
-                        {session.filename.replace('sessions/', '')}
-                      </p>
-                      <p className="mt-1 text-xs text-low">
-                        {session.source === 'both'
-                          ? '로컬 + 서버'
-                          : session.source}
-                      </p>
+                      룸 문서 {snapshot.library.length}
                     </button>
-                  ))}
-                  {snapshot.sessions.length === 0 && (
-                    <p className="p-5 text-center text-sm text-low">
-                      아직 세션 기록이 없습니다.
-                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setSidePanel('sessions')}
+                      className={cn(
+                        'rounded-md px-3 py-2 text-sm',
+                        sidePanel === 'sessions'
+                          ? 'bg-primary text-high'
+                          : 'text-low hover:text-high'
+                      )}
+                    >
+                      세션 {snapshot.sessions.length}
+                    </button>
+                  </div>
+                  {sidePanel === 'library' && (
+                    <div className="flex items-center gap-2">
+                      {snapshot.room.ssh_alias && (
+                        <button
+                          type="button"
+                          disabled={busy || !snapshot.remote.available}
+                          onClick={() => void importRemoteDocuments()}
+                          title="서버 .ai-room의 세션 외 Markdown 파일을 가져옵니다."
+                          className="flex items-center gap-1 rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-primary disabled:opacity-40"
+                        >
+                          <CloudIcon className="h-3.5 w-3.5" /> 서버 문서
+                          가져오기
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void createLibraryFile()}
+                        className="flex items-center gap-1 rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-primary disabled:opacity-40"
+                      >
+                        <PlusIcon className="h-3.5 w-3.5" /> 새 문서
+                      </button>
+                    </div>
                   )}
                 </div>
-                <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-4 font-mono text-xs leading-5 text-normal">
-                  {activeSession?.content ||
-                    'Claude 또는 Codex가 첫 작업을 시작하면 여기에 기록이 나타납니다.'}
-                </pre>
+                {sidePanel === 'library' ? (
+                  <>
+                    <div className="max-h-48 overflow-y-auto border-b border-border p-2">
+                      {snapshot.library.map((file) => (
+                        <button
+                          key={file.filename}
+                          onClick={() => setSelectedLibraryFile(file.filename)}
+                          className={cn(
+                            'mb-1 w-full rounded-md p-2 text-left',
+                            activeLibrary?.filename === file.filename
+                              ? 'bg-primary'
+                              : 'hover:bg-primary/60'
+                          )}
+                        >
+                          <p className="flex items-center gap-2 truncate font-mono text-xs text-high">
+                            <FileTextIcon className="h-4 w-4 shrink-0" />
+                            {file.filename.replace('library/', '')}
+                          </p>
+                          <p className="mt-1 pl-6 text-xs text-low">
+                            {file.source === 'both'
+                              ? '로컬 + 서버'
+                              : file.source}
+                          </p>
+                        </button>
+                      ))}
+                      {snapshot.library.length === 0 && (
+                        <p className="p-5 text-center text-sm leading-6 text-low">
+                          AI에게 작업 방식이나 규칙을 룸에 저장하라고 하면
+                          여기에 문서가 나타납니다.
+                        </p>
+                      )}
+                    </div>
+                    <textarea
+                      value={libraryDraft}
+                      onChange={(event) => setLibraryDraft(event.target.value)}
+                      disabled={!activeLibrary}
+                      spellCheck={false}
+                      placeholder="선택한 룸 문서의 내용이 여기에 표시됩니다."
+                      className="min-h-0 flex-1 resize-none bg-transparent p-4 font-mono text-xs leading-5 text-normal outline-none disabled:opacity-50"
+                    />
+                    <div className="flex justify-between gap-2 border-t border-border p-3">
+                      <button
+                        type="button"
+                        disabled={busy || !activeLibrary}
+                        onClick={() => void deleteLibraryFile()}
+                        className="flex items-center gap-1 rounded-md border border-red-500/40 px-3 py-1.5 text-sm text-red-400 hover:bg-red-500/10 disabled:opacity-40"
+                      >
+                        <TrashIcon className="h-4 w-4" /> 문서 삭제
+                      </button>
+                      <button
+                        type="button"
+                        disabled={
+                          busy ||
+                          !activeLibrary ||
+                          libraryDraft === activeLibrary.content
+                        }
+                        onClick={() => void saveLibraryFile()}
+                        className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-primary disabled:opacity-40"
+                      >
+                        문서 저장
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="max-h-48 overflow-y-auto border-b border-border p-2">
+                      {snapshot.sessions.map((session) => (
+                        <button
+                          key={session.filename}
+                          onClick={() => setSelectedSession(session.filename)}
+                          className={cn(
+                            'mb-1 w-full rounded-md p-2 text-left',
+                            activeSession?.filename === session.filename
+                              ? 'bg-primary'
+                              : 'hover:bg-primary/60'
+                          )}
+                        >
+                          <p className="truncate font-mono text-xs text-high">
+                            {session.filename.replace('sessions/', '')}
+                          </p>
+                          <p className="mt-1 text-xs text-low">
+                            {session.source === 'both'
+                              ? '로컬 + 서버'
+                              : session.source}
+                          </p>
+                        </button>
+                      ))}
+                      {snapshot.sessions.length === 0 && (
+                        <p className="p-5 text-center text-sm text-low">
+                          아직 세션 기록이 없습니다.
+                        </p>
+                      )}
+                    </div>
+                    <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-4 font-mono text-xs leading-5 text-normal">
+                      {activeSession?.content ||
+                        'Claude 또는 Codex가 첫 작업을 시작하면 여기에 기록이 나타납니다.'}
+                    </pre>
+                  </>
+                )}
               </section>
             </div>
 

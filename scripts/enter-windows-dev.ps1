@@ -11,5 +11,4 @@ Write-Host 'Common commands:' -ForegroundColor Cyan
 Write-Host '  pnpm run dev'
 Write-Host '  pnpm --filter @vibe/local-web check'
 Write-Host '  cargo test -p server ssh_hosts --lib'
-Write-Host '  cargo build -p vibe-kanban-tauri --release'
-
+Write-Host '  cargo build -p task-ai-platform --release'

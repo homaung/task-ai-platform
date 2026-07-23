@@ -280,7 +280,7 @@ jobs:
         run: |
           set -x
           cargo fmt --all -- --check & pid_fmt=$!
-          cargo clippy --workspace --all-targets --exclude vibe-kanban-tauri -- -D warnings
+          cargo clippy --workspace --all-targets --exclude task-ai-platform -- -D warnings
           wait $pid_fmt
 
   backend-test:
@@ -303,7 +303,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Run Cargo tests
-        run: cargo nextest run --workspace --exclude vibe-kanban-tauri
+        run: cargo nextest run --workspace --exclude task-ai-platform
 
   tauri-checks:
     needs: changes
@@ -333,4 +333,4 @@ jobs:
         run: |
           cargo fmt --all --manifest-path crates/tauri-app/Cargo.toml -- --check
           cargo clippy --all-targets --manifest-path crates/tauri-app/Cargo.toml -- -D warnings
-          cargo check -p vibe-kanban-tauri
+          cargo check -p task-ai-platform

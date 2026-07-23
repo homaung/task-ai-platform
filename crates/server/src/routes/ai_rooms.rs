@@ -28,7 +28,9 @@ use crate::{
 };
 
 const ROOM_DIR: &str = ".ai-room";
-const INSTRUCTION_VERSION: i64 = 3;
+const LIBRARY_DIR: &str = "library";
+const LIBRARY_BASELINE_FILE: &str = ".library-baseline.json";
+const INSTRUCTION_VERSION: i64 = 4;
 const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
 const CLEAR_SEND_ENV: &str = "SendEnv=-*";
 const START_MARKER: &str = "<!-- task-ai-room:start -->";
@@ -67,6 +69,7 @@ pub struct AiRoomSnapshot {
     pub decisions: String,
     pub tasks: String,
     pub sessions: Vec<AiRoomRecord>,
+    pub library: Vec<AiRoomRecord>,
     pub conflicts: Vec<String>,
     pub local: AiRoomEndpointState,
     pub remote: AiRoomEndpointState,
@@ -219,6 +222,83 @@ pub async fn update_document(
     )))
 }
 
+pub async fn update_library_file(
+    State(deployment): State<DeploymentImpl>,
+    Path((room_id, filename)): Path<(Uuid, String)>,
+    Json(payload): Json<UpdateAiRoomDocumentRequest>,
+) -> Result<ResponseJson<ApiResponse<AiRoomSnapshot>>, ApiError> {
+    if payload.content.len() > MAX_DOCUMENT_BYTES {
+        return Err(ApiError::PayloadTooLarge);
+    }
+    let relative = library_path(&filename)?;
+    let room = find_room(&deployment, room_id).await?;
+    write_local_file(&room, &relative, &payload.content).await?;
+    AiRoom::touch(&deployment.db().pool, room.id).await?;
+    let room = find_room(&deployment, room_id).await?;
+    Ok(ResponseJson(ApiResponse::success(
+        build_snapshot(room).await,
+    )))
+}
+
+pub async fn delete_library_file(
+    State(deployment): State<DeploymentImpl>,
+    Path((room_id, filename)): Path<(Uuid, String)>,
+) -> Result<ResponseJson<ApiResponse<AiRoomSnapshot>>, ApiError> {
+    let relative = library_path(&filename)?;
+    let room = find_room(&deployment, room_id).await?;
+
+    if let (Some(alias), Some(root)) = (&room.ssh_alias, &room.remote_root) {
+        delete_remote_library_file(alias, root, &filename).await?;
+    }
+
+    let path = safe_room_path(&room, &relative)?;
+    match fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    AiRoom::touch(&deployment.db().pool, room.id).await?;
+    let room = find_room(&deployment, room_id).await?;
+    Ok(ResponseJson(ApiResponse::success(
+        build_snapshot(room).await,
+    )))
+}
+
+pub async fn import_remote_documents(
+    State(deployment): State<DeploymentImpl>,
+    Path(room_id): Path<Uuid>,
+) -> Result<ResponseJson<ApiResponse<SyncAiRoomResponse>>, ApiError> {
+    let _guard = SYNC_LOCK.lock().await;
+    let room = find_room(&deployment, room_id).await?;
+    if room.ssh_alias.is_none() || room.remote_root.is_none() {
+        return Err(ApiError::BadRequest("This room has no SSH server".into()));
+    }
+
+    let mut local = read_local_files(&room).await;
+    let remote = read_remote_files(&room).await;
+    if !remote.available {
+        return Err(ApiError::BadRequest(
+            remote
+                .error
+                .unwrap_or_else(|| "Server room documents are unavailable".into()),
+        ));
+    }
+
+    let (copied_to_local, conflicts) =
+        merge_remote_library_documents(&room, &mut local.files, &remote.files).await?;
+    AiRoom::touch(&deployment.db().pool, room.id).await?;
+    let room = find_room(&deployment, room_id).await?;
+    let snapshot = build_snapshot(room).await;
+    Ok(ResponseJson(ApiResponse::success(SyncAiRoomResponse {
+        copied_to_local,
+        copied_to_remote: Vec::new(),
+        removed_from_remote: Vec::new(),
+        conflicts,
+        snapshot,
+    })))
+}
+
 pub async fn sync_room(
     State(deployment): State<DeploymentImpl>,
     Path(room_id): Path<Uuid>,
@@ -234,7 +314,7 @@ async fn sync_room_internal(
     deployment: &DeploymentImpl,
     room: AiRoom,
 ) -> Result<SyncAiRoomResponse, ApiError> {
-    let local = read_local_files(&room).await;
+    let mut local = read_local_files(&room).await;
     let mut copied_to_local = Vec::new();
     let copied_to_remote = Vec::new();
     let mut removed_from_remote = Vec::new();
@@ -284,8 +364,13 @@ async fn sync_room_internal(
             }
         }
 
+        let (library_copies, library_conflicts) =
+            merge_remote_library_documents(&room, &mut local.files, &remote.files).await?;
+        copied_to_local.extend(library_copies);
+        conflicts.extend(library_conflicts);
+
         if conflicts.is_empty() {
-            removed_from_remote = clean_remote_room(alias, root).await?;
+            removed_from_remote = clean_remote_room(alias, root, &remote.files).await?;
         }
     }
 
@@ -422,7 +507,7 @@ fn normalized_local_path(path: &FsPath) -> String {
 
 fn room_instruction(room: &AiRoom) -> String {
     format!(
-        "# AI Room: {name}\n\nRoom ID: `{id}`\nInstruction version: {version}\n\n## Required session workflow\n\n1. Before doing any work, read `.ai-room/context.md`, `.ai-room/decisions.md`, `.ai-room/tasks.md`, and the newest files in `.ai-room/sessions/`.\n2. Create one new session file named `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<short-id>.md`. Never reuse another session's filename.\n3. Record the goal, assumptions, important commands, files changed, verification results, decisions, blockers, and concrete next steps. Update it during the session, not only at the end.\n4. Do not edit the `## AI session updates` section in `tasks.md`. The Task AI Platform reads each completed session locally and appends one validated status line automatically. Make the result, completion state, next action, and blockers explicit in the session file so the local summarizer can report them accurately.\n5. Update `context.md` only for durable project facts. Append architectural decisions to `decisions.md`; do not rewrite history.\n6. Never store secrets, tokens, private keys, or raw credentials in room files.\n7. Before ending, make the session file sufficient for another Claude or Codex session to continue without relying on chat history. After all other writes are finished, add `{complete_marker}` as the final line of the session file. The app uses this exact marker to know the session is safe to synchronize, summarize locally, and remove from the server.\n\n## Server privacy\n\nWhen this room is prepared on its SSH server, all `.ai-room` files there are temporary. The Task AI Platform automatically copies completed session files to the local root, then removes the server-side room files after a conflict-free sync. The local task summarizer uses only the local Ollama service; session contents are not sent to a cloud model. Do not assume earlier session files remain on the server.\n\n## Room endpoints\n\n- Local root: `{local}`\n- Remote root: `{remote}`\n\nThe Task AI Platform manages and synchronizes these records. Claude and Codex perform the project work directly in the selected root.\n",
+        "# AI Room: {name}\n\nRoom ID: `{id}`\nInstruction version: {version}\n\n## Required session workflow\n\n1. Before doing any work, read `.ai-room/context.md`, `.ai-room/decisions.md`, `.ai-room/tasks.md`, every relevant file in `.ai-room/library/`, and the newest files in `.ai-room/sessions/`.\n2. Create one new session file named `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<short-id>.md`. Never reuse another session's filename.\n3. Record the goal, assumptions, important commands, files changed, verification results, decisions, blockers, and concrete next steps. Update it during the session, not only at the end.\n4. When the user asks you to remember a reusable method, rule, convention, checklist, prompt, or operating procedure, create or update one focused Markdown file in `.ai-room/library/`. Use a descriptive filename ending in `.md`, keep one topic per file, and make it understandable without chat history. Do not use the library for transient session notes.\n5. Do not edit the `## AI session updates` section in `tasks.md`. The Task AI Platform reads each completed session locally and appends one validated status line automatically. Make the result, completion state, next action, and blockers explicit in the session file so the local summarizer can report them accurately.\n6. Update `context.md` only for durable project facts. Append architectural decisions to `decisions.md`; do not rewrite history.\n7. Never store secrets, tokens, private keys, raw credentials, personal data, or generated binaries in room files.\n8. Before ending, make the session file sufficient for another Claude or Codex session to continue without relying on chat history. After all other writes are finished, add `{complete_marker}` as the final line of the session file. The app uses this exact marker to know the session is safe to synchronize, summarize locally, and remove from the server.\n\n## Server privacy\n\nWhen this room is prepared on its SSH server, all `.ai-room` files there are temporary. The Task AI Platform safely merges library documents and copies completed session files to the local root, then removes the server-side room files after a conflict-free sync. The local task summarizer uses only the local Ollama service; session contents are not sent to a cloud model. Do not assume earlier session files remain on the server.\n\n## Room endpoints\n\n- Local root: `{local}`\n- Remote root: `{remote}`\n\nThe Task AI Platform manages and synchronizes these records. Claude and Codex perform the project work directly in the selected root.\n",
         name = room.name,
         id = room.id,
         version = INSTRUCTION_VERSION,
@@ -508,6 +593,74 @@ fn session_is_complete(content: &str) -> bool {
         .is_some_and(|line| line.trim() == SESSION_COMPLETE_MARKER)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum LibraryMergeAction {
+    Same,
+    AcceptRemote,
+    KeepLocal,
+    Conflict,
+}
+
+fn library_merge_action(
+    local: &str,
+    remote: &str,
+    baseline_hash: Option<&str>,
+) -> LibraryMergeAction {
+    if local == remote {
+        return LibraryMergeAction::Same;
+    }
+    match baseline_hash {
+        Some(baseline) if content_hash(local) == baseline => LibraryMergeAction::AcceptRemote,
+        Some(baseline) if content_hash(remote) == baseline => LibraryMergeAction::KeepLocal,
+        _ => LibraryMergeAction::Conflict,
+    }
+}
+
+fn library_baseline(files: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    files
+        .get(LIBRARY_BASELINE_FILE)
+        .and_then(|content| serde_json::from_str(content).ok())
+        .unwrap_or_default()
+}
+
+async fn merge_remote_library_documents(
+    room: &AiRoom,
+    local_files: &mut BTreeMap<String, String>,
+    remote_files: &BTreeMap<String, String>,
+) -> Result<(Vec<String>, Vec<String>), ApiError> {
+    let baseline = library_baseline(remote_files);
+    let remote_documents = remote_library_documents(remote_files);
+    let mut copied = Vec::new();
+    let mut conflicts = Vec::new();
+
+    for (filename, remote_content) in &remote_documents {
+        match local_files.get(filename) {
+            None => {
+                write_local_file(room, &filename, remote_content).await?;
+                local_files.insert(filename.clone(), remote_content.clone());
+                copied.push(filename.clone());
+            }
+            Some(local_content) => {
+                match library_merge_action(
+                    local_content,
+                    remote_content,
+                    baseline.get(filename).map(String::as_str),
+                ) {
+                    LibraryMergeAction::Same | LibraryMergeAction::KeepLocal => {}
+                    LibraryMergeAction::AcceptRemote => {
+                        write_local_file(room, &filename, remote_content).await?;
+                        local_files.insert(filename.clone(), remote_content.clone());
+                        copied.push(filename.clone());
+                    }
+                    LibraryMergeAction::Conflict => conflicts.push(filename.clone()),
+                }
+            }
+        }
+    }
+
+    Ok((copied, conflicts))
+}
+
 fn ensure_task_update_section(content: &str) -> String {
     if content.contains("## AI session updates") {
         content.to_string()
@@ -564,7 +717,7 @@ async fn summarize_next_session(room: &AiRoom) -> Result<(), String> {
     sessions.sort_by(|left, right| left.0.cmp(&right.0));
 
     for (filename, content) in sessions {
-        let hash = session_hash(&content);
+        let hash = content_hash(&content);
         if state.processed_sessions.get(&filename) == Some(&hash) {
             continue;
         }
@@ -623,7 +776,7 @@ async fn write_task_summary_state(
         .map_err(|error| format!("Unable to save local task summary state: {error}"))
 }
 
-fn session_hash(content: &str) -> String {
+fn content_hash(content: &str) -> String {
     format!("{:x}", Sha256::digest(content.as_bytes()))
 }
 
@@ -796,6 +949,7 @@ fn session_identity(filename: &str) -> (String, String) {
 async fn initialize_local(room: &AiRoom) -> Result<(), ApiError> {
     let room_dir = PathBuf::from(&room.local_root).join(ROOM_DIR);
     fs::create_dir_all(room_dir.join("sessions")).await?;
+    fs::create_dir_all(room_dir.join(LIBRARY_DIR)).await?;
     for (relative, content) in initial_files(room) {
         let path = room_dir.join(relative);
         if path
@@ -849,6 +1003,19 @@ async fn prepare_remote(room: &AiRoom, alias: &str, root: &str) -> Result<(), Ap
         })?;
         files.push((relative.to_string(), content));
     }
+    let mut library_baseline = BTreeMap::new();
+    for (relative, content) in local
+        .files
+        .iter()
+        .filter(|(relative, _)| relative.starts_with("library/"))
+    {
+        files.push((relative.clone(), content.clone()));
+        library_baseline.insert(relative.clone(), content_hash(content));
+    }
+    files.push((
+        LIBRARY_BASELINE_FILE.into(),
+        serde_json::to_string_pretty(&library_baseline).unwrap(),
+    ));
     let block = managed_agent_block(room);
     for filename in ["AGENTS.md", "CLAUDE.md"] {
         let existing = read_remote_root_file(alias, root, filename)
@@ -859,13 +1026,30 @@ async fn prepare_remote(room: &AiRoom, alias: &str, root: &str) -> Result<(), Ap
     write_remote_files(alias, root, &files).await
 }
 
-async fn clean_remote_room(alias: &str, root: &str) -> Result<Vec<String>, ApiError> {
-    let script = format!(
-        "root={}; room=\"$root/{}\"; for filename in AGENTS.md CLAUDE.md; do file=\"$root/$filename\"; [ -f \"$file\" ] || continue; tmp=\"$file.task-ai-room.$$.tmp\"; awk -v start='{}' -v end='{}' '$0 == start {{ skipping = 1; next }} $0 == end {{ skipping = 0; next }} !skipping {{ print }}' \"$file\" > \"$tmp\" && mv \"$tmp\" \"$file\" || exit 1; [ -s \"$file\" ] || rm -f \"$file\"; done; for name in room.json ROOM.md context.md decisions.md tasks.md; do rm -f \"$room/$name\" || exit 1; done; rm -f \"$room\"/sessions/*.md || exit 1; rmdir \"$room/sessions\" 2>/dev/null || true; rmdir \"$room\" 2>/dev/null || true;",
+async fn clean_remote_room(
+    alias: &str,
+    root: &str,
+    remote_files: &BTreeMap<String, String>,
+) -> Result<Vec<String>, ApiError> {
+    let mut script = format!(
+        "root={}; room=\"$root/{}\"; for filename in AGENTS.md CLAUDE.md; do file=\"$root/$filename\"; [ -f \"$file\" ] || continue; tmp=\"$file.task-ai-room.$$.tmp\"; awk -v start='{}' -v end='{}' '$0 == start {{ skipping = 1; next }} $0 == end {{ skipping = 0; next }} !skipping {{ print }}' \"$file\" > \"$tmp\" && mv \"$tmp\" \"$file\" || exit 1; [ -s \"$file\" ] || rm -f \"$file\"; done; for name in room.json ROOM.md context.md decisions.md tasks.md {}; do rm -f \"$room/$name\" || exit 1; done; rm -f \"$room\"/sessions/*.md \"$room\"/library/*.md || exit 1;",
         posix_quote(root),
         ROOM_DIR,
         START_MARKER,
         END_MARKER,
+        LIBRARY_BASELINE_FILE,
+    );
+    for filename in remote_files
+        .keys()
+        .filter_map(|name| name.strip_prefix("root-documents/"))
+    {
+        script.push_str(&format!(
+            " rm -f \"$room/{}\" || exit 1;",
+            filename.replace('"', "")
+        ));
+    }
+    script.push_str(
+        " rmdir \"$room/sessions\" 2>/dev/null || true; rmdir \"$room/library\" 2>/dev/null || true; rmdir \"$room\" 2>/dev/null || true;",
     );
     let output = run_remote(alias, &script).await?;
     if !output.status.success() {
@@ -879,6 +1063,33 @@ async fn clean_remote_room(alias: &str, root: &str) -> Result<Vec<String>, ApiEr
         "CLAUDE.md managed block".into(),
         format!("{ROOM_DIR}/"),
     ])
+}
+
+async fn delete_remote_library_file(
+    alias: &str,
+    root: &str,
+    filename: &str,
+) -> Result<(), ApiError> {
+    let root_document = if is_reserved_room_filename(filename) {
+        String::new()
+    } else {
+        " \"$room/$name\"".into()
+    };
+    let script = format!(
+        "root={}; room=\"$root/{}\"; name={}; rm -f \"$room/library/$name\"{}",
+        posix_quote(root),
+        ROOM_DIR,
+        posix_quote(filename),
+        root_document,
+    );
+    let output = run_remote(alias, &script).await?;
+    if !output.status.success() {
+        return Err(ApiError::BadRequest(format!(
+            "Unable to delete room document on {alias}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
 }
 
 async fn write_local_file(room: &AiRoom, relative: &str, content: &str) -> Result<(), ApiError> {
@@ -910,8 +1121,9 @@ async fn write_remote_files(
     files: &[(String, String)],
 ) -> Result<(), ApiError> {
     let quoted_root = posix_quote(root);
-    let mut script =
-        format!("root={quoted_root}; mkdir -p \"$root/{ROOM_DIR}/sessions\" || exit 1;");
+    let mut script = format!(
+        "root={quoted_root}; mkdir -p \"$root/{ROOM_DIR}/sessions\" \"$root/{ROOM_DIR}/library\" || exit 1;"
+    );
     for (relative, content) in files {
         if content.len() > MAX_DOCUMENT_BYTES {
             return Err(ApiError::PayloadTooLarge);
@@ -1014,6 +1226,17 @@ async fn read_local_files(room: &AiRoom) -> EndpointFiles {
             }
         }
     }
+    if let Ok(mut entries) = fs::read_dir(room_dir.join(LIBRARY_DIR)).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if valid_library_filename(&name)
+                && let Ok(content) = fs::read_to_string(entry.path()).await
+                && content.len() <= MAX_DOCUMENT_BYTES
+            {
+                result.files.insert(format!("library/{name}"), content);
+            }
+        }
+    }
     result
 }
 
@@ -1023,9 +1246,20 @@ async fn read_remote_files(room: &AiRoom) -> EndpointFiles {
     };
     let script = format!(
         r#"root={root}; room="$root/{room_dir}"; [ -d "$room" ] || exit 2;
-for name in ROOM.md context.md decisions.md tasks.md; do
+for name in ROOM.md context.md decisions.md tasks.md {baseline}; do
   file="$room/$name"; [ -f "$file" ] || continue
   printf '%s\t' "$name"; base64 "$file" | tr -d '\n'; printf '\n'
+done
+for file in "$room"/*.md; do
+  [ -f "$file" ] || continue
+  name=$(basename "$file")
+  case "$name" in ROOM.md|context.md|decisions.md|tasks.md) continue ;; esac
+  printf 'root-documents/%s\t' "$name"; base64 "$file" | tr -d '\n'; printf '\n'
+done
+for file in "$room"/library/*.md; do
+  [ -f "$file" ] || continue
+  name=$(basename "$file")
+  printf 'library/%s\t' "$name"; base64 "$file" | tr -d '\n'; printf '\n'
 done
 for file in "$room"/sessions/*.md; do
   [ -f "$file" ] || continue
@@ -1034,6 +1268,7 @@ for file in "$room"/sessions/*.md; do
 done"#,
         root = posix_quote(root),
         room_dir = ROOM_DIR,
+        baseline = LIBRARY_BASELINE_FILE,
     );
     let output = match run_remote(alias, &script).await {
         Ok(output) => output,
@@ -1065,11 +1300,34 @@ done"#,
         if let Ok(bytes) = BASE64.decode(encoded)
             && let Ok(content) = String::from_utf8(bytes)
             && content.len() <= MAX_DOCUMENT_BYTES
+            && (filename == LIBRARY_BASELINE_FILE
+                || (!filename.starts_with("library/") && !filename.starts_with("root-documents/"))
+                || filename
+                    .strip_prefix("library/")
+                    .or_else(|| filename.strip_prefix("root-documents/"))
+                    .is_some_and(valid_library_filename))
         {
             result.files.insert(filename.to_string(), content);
         }
     }
     result
+}
+
+fn remote_library_documents(files: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut documents = BTreeMap::new();
+    for (filename, content) in files.iter().filter_map(|(name, content)| {
+        name.strip_prefix("root-documents/")
+            .map(|filename| (filename, content))
+    }) {
+        documents.insert(format!("library/{filename}"), content.clone());
+    }
+    for (filename, content) in files
+        .iter()
+        .filter(|(name, _)| name.starts_with("library/"))
+    {
+        documents.insert(filename.clone(), content.clone());
+    }
+    documents
 }
 
 async fn build_snapshot(room: AiRoom) -> AiRoomSnapshot {
@@ -1115,6 +1373,51 @@ async fn build_snapshot(room: AiRoom) -> AiRoomSnapshot {
             _ => {}
         }
     }
+    let baseline = library_baseline(&remote.files);
+    let remote_library = remote_library_documents(&remote.files);
+    let mut library = Vec::new();
+    let mut library_names = local
+        .files
+        .keys()
+        .chain(remote_library.keys())
+        .filter(|name| name.starts_with("library/"))
+        .cloned()
+        .collect::<Vec<_>>();
+    library_names.sort();
+    library_names.dedup();
+    for filename in library_names {
+        match (local.files.get(&filename), remote_library.get(&filename)) {
+            (Some(left), Some(right)) => {
+                let action =
+                    library_merge_action(left, right, baseline.get(&filename).map(String::as_str));
+                let (content, source) = match action {
+                    LibraryMergeAction::Same => (left.clone(), "both"),
+                    LibraryMergeAction::AcceptRemote => (right.clone(), "remote"),
+                    LibraryMergeAction::KeepLocal => (left.clone(), "local"),
+                    LibraryMergeAction::Conflict => {
+                        conflicts.push(filename.clone());
+                        (left.clone(), "conflict")
+                    }
+                };
+                library.push(AiRoomRecord {
+                    filename,
+                    content,
+                    source: source.into(),
+                });
+            }
+            (Some(content), None) => library.push(AiRoomRecord {
+                filename,
+                content: content.clone(),
+                source: "local".into(),
+            }),
+            (None, Some(content)) => library.push(AiRoomRecord {
+                filename,
+                content: content.clone(),
+                source: "remote".into(),
+            }),
+            _ => {}
+        }
+    }
     let value = |name: &str| {
         local
             .files
@@ -1129,6 +1432,7 @@ async fn build_snapshot(room: AiRoom) -> AiRoomSnapshot {
         decisions: value("decisions.md"),
         tasks: value("tasks.md"),
         sessions,
+        library,
         conflicts,
         local: AiRoomEndpointState {
             configured: true,
@@ -1155,6 +1459,33 @@ fn document_path(kind: &str) -> Result<&'static str, ApiError> {
     }
 }
 
+fn valid_library_filename(filename: &str) -> bool {
+    !filename.is_empty()
+        && filename.len() <= 120
+        && filename.ends_with(".md")
+        && !filename.starts_with('.')
+        && !filename.contains(['/', '\\', '\0', '\r', '\n', '\t'])
+        && filename
+            .chars()
+            .all(|value| value.is_alphanumeric() || matches!(value, '-' | '_' | ' ' | '.'))
+}
+
+fn is_reserved_room_filename(filename: &str) -> bool {
+    matches!(
+        filename,
+        "ROOM.md" | "context.md" | "decisions.md" | "tasks.md"
+    )
+}
+
+fn library_path(filename: &str) -> Result<String, ApiError> {
+    if !valid_library_filename(filename) {
+        return Err(ApiError::BadRequest(
+            "Library filename must be a safe Markdown filename ending in .md".into(),
+        ));
+    }
+    Ok(format!("{LIBRARY_DIR}/{filename}"))
+}
+
 pub fn router() -> Router<DeploymentImpl> {
     Router::new()
         .route("/ai-rooms", get(list_rooms).post(create_room))
@@ -1168,7 +1499,15 @@ pub fn router() -> Router<DeploymentImpl> {
             post(prepare_remote_room),
         )
         .route("/ai-rooms/{room_id}/sync", post(sync_room))
+        .route(
+            "/ai-rooms/{room_id}/import-remote-documents",
+            post(import_remote_documents),
+        )
         .route("/ai-rooms/{room_id}/documents/{kind}", put(update_document))
+        .route(
+            "/ai-rooms/{room_id}/library/{filename}",
+            put(update_library_file).delete(delete_library_file),
+        )
 }
 
 #[cfg(test)]
@@ -1305,5 +1644,106 @@ mod tests {
         assert!(bounded.starts_with("가나다"));
         assert!(bounded.contains("...[truncated]..."));
         assert!(bounded.ends_with('하'));
+    }
+
+    #[test]
+    fn validates_flat_markdown_library_filenames() {
+        assert!(valid_library_filename("review-checklist.md"));
+        assert!(valid_library_filename("배포 절차.md"));
+        assert!(!valid_library_filename("../secret.md"));
+        assert!(!valid_library_filename("nested/method.md"));
+        assert!(!valid_library_filename(".hidden.md"));
+        assert!(!valid_library_filename("binary.exe"));
+    }
+
+    #[test]
+    fn maps_server_root_markdown_into_room_documents() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "root-documents/deploy-notes.md".into(),
+            "# Server notes".into(),
+        );
+        files.insert("library/review-method.md".into(), "# Review method".into());
+
+        let documents = remote_library_documents(&files);
+
+        assert_eq!(
+            documents.get("library/deploy-notes.md"),
+            Some(&"# Server notes".to_string())
+        );
+        assert_eq!(
+            documents.get("library/review-method.md"),
+            Some(&"# Review method".to_string())
+        );
+    }
+
+    #[test]
+    fn protects_managed_room_documents_from_library_deletion() {
+        assert!(is_reserved_room_filename("context.md"));
+        assert!(is_reserved_room_filename("ROOM.md"));
+        assert!(!is_reserved_room_filename("deploy-notes.md"));
+    }
+
+    #[test]
+    fn three_way_merges_library_documents_safely() {
+        let base = "# Method\n\nOriginal";
+        let local = "# Method\n\nLocal edit";
+        let remote = "# Method\n\nRemote edit";
+        let baseline = content_hash(base);
+
+        assert_eq!(
+            library_merge_action(base, remote, Some(&baseline)),
+            LibraryMergeAction::AcceptRemote
+        );
+        assert_eq!(
+            library_merge_action(local, base, Some(&baseline)),
+            LibraryMergeAction::KeepLocal
+        );
+        assert_eq!(
+            library_merge_action(local, remote, Some(&baseline)),
+            LibraryMergeAction::Conflict
+        );
+        assert_eq!(
+            library_merge_action(remote, remote, Some(&baseline)),
+            LibraryMergeAction::Same
+        );
+        assert_eq!(
+            library_merge_action(local, remote, None),
+            LibraryMergeAction::Conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn discovers_ai_created_library_documents() {
+        let root = tempfile::tempdir().unwrap();
+        let room_dir = root.path().join(ROOM_DIR);
+        fs::create_dir_all(room_dir.join(LIBRARY_DIR))
+            .await
+            .unwrap();
+        fs::write(
+            room_dir.join(LIBRARY_DIR).join("review-method.md"),
+            "# Review method",
+        )
+        .await
+        .unwrap();
+        let room = AiRoom {
+            id: Uuid::nil(),
+            name: "room".into(),
+            description: None,
+            local_root: normalized_local_path(root.path()),
+            ssh_alias: None,
+            remote_root: None,
+            instruction_version: INSTRUCTION_VERSION,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let files = read_local_files(&room).await;
+
+        assert!(files.available);
+        assert_eq!(
+            files.files.get("library/review-method.md"),
+            Some(&"# Review method".to_string())
+        );
     }
 }

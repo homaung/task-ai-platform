@@ -77,7 +77,7 @@ if (!wixArch) {
 }
 
 // Binary path
-const binaryName = "vibe-kanban-tauri.exe";
+const binaryName = "task-ai-platform.exe";
 const mainBinaryPath = path.join(
   projectRoot,
   "target",

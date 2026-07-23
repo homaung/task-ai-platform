@@ -1868,6 +1868,18 @@ export const aiRoomsApi = {
     return handleApiResponse<SyncAiRoomResponse>(response);
   },
 
+  importRemoteDocuments: async (
+    roomId: string
+  ): Promise<SyncAiRoomResponse> => {
+    const response = await makeRequest(
+      `/api/ai-rooms/${roomId}/import-remote-documents`,
+      {
+        method: 'POST',
+      }
+    );
+    return handleApiResponse<SyncAiRoomResponse>(response);
+  },
+
   updateDocument: async (
     roomId: string,
     kind: 'context' | 'decisions' | 'tasks',
@@ -1878,6 +1890,34 @@ export const aiRoomsApi = {
       {
         method: 'PUT',
         body: JSON.stringify({ content }),
+      }
+    );
+    return handleApiResponse<AiRoomSnapshot>(response);
+  },
+
+  updateLibraryFile: async (
+    roomId: string,
+    filename: string,
+    content: string
+  ): Promise<AiRoomSnapshot> => {
+    const response = await makeRequest(
+      `/api/ai-rooms/${roomId}/library/${encodeURIComponent(filename)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ content }),
+      }
+    );
+    return handleApiResponse<AiRoomSnapshot>(response);
+  },
+
+  deleteLibraryFile: async (
+    roomId: string,
+    filename: string
+  ): Promise<AiRoomSnapshot> => {
+    const response = await makeRequest(
+      `/api/ai-rooms/${roomId}/library/${encodeURIComponent(filename)}`,
+      {
+        method: 'DELETE',
       }
     );
     return handleApiResponse<AiRoomSnapshot>(response);

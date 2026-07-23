@@ -342,7 +342,7 @@ export type AiRoomEndpointState = { configured: boolean, available: boolean, ins
 
 export type AiRoomRecord = { filename: string, content: string, source: string, };
 
-export type AiRoomSnapshot = { room: AiRoom, instruction: string, context: string, decisions: string, tasks: string, sessions: Array<AiRoomRecord>, conflicts: Array<string>, local: AiRoomEndpointState, remote: AiRoomEndpointState, };
+export type AiRoomSnapshot = { room: AiRoom, instruction: string, context: string, decisions: string, tasks: string, sessions: Array<AiRoomRecord>, library: Array<AiRoomRecord>, conflicts: Array<string>, local: AiRoomEndpointState, remote: AiRoomEndpointState, };
 
 export type UpdateAiRoomDocumentRequest = { content: string, };
 

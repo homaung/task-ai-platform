@@ -1,11 +1,18 @@
 [package]
-name = "vibe-kanban-tauri"
+name = "task-ai-platform"
 version = "0.1.36"
 edition = "2024"
+description = "Local-first AI project room and handoff manager"
+license = "Apache-2.0"
+repository = "https://github.com/homaung/task-ai-platform"
 
 [[bin]]
-name = "vibe-kanban-tauri"
+name = "task-ai-platform"
 path = "src/main.rs"
+
+[package.metadata.task-ai-platform]
+upstream = "https://github.com/BloopAI/vibe-kanban"
+upstream-version = "0.1.36"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

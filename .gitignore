@@ -82,6 +82,9 @@ dev_assets
 /packages/web/.env.sentry-build-plugin
 .ssh
 
+# Local desktop artifact copied from the release build for easy launching
+/Task AI Platform.exe
+
 vibe-kanban-cloud/
 
 .jj
