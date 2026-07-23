@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    env,
     path::{Path as FsPath, PathBuf},
     time::Duration,
 };
@@ -14,6 +15,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use db::models::ai_room::{AiRoom, CreateAiRoom};
 use deployment::Deployment;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{fs, sync::Mutex};
 use ts_rs::TS;
 use utils::response::ApiResponse;
@@ -26,14 +28,21 @@ use crate::{
 };
 
 const ROOM_DIR: &str = ".ai-room";
-const INSTRUCTION_VERSION: i64 = 2;
+const INSTRUCTION_VERSION: i64 = 3;
 const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
 const CLEAR_SEND_ENV: &str = "SendEnv=-*";
 const START_MARKER: &str = "<!-- task-ai-room:start -->";
 const END_MARKER: &str = "<!-- task-ai-room:end -->";
 const SESSION_COMPLETE_MARKER: &str = "<!-- task-ai-room:complete -->";
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(15);
+const TASK_SUMMARY_INTERVAL: Duration = Duration::from_secs(45);
+const TASK_SUMMARY_STATE_FILE: &str = "task-summary-state.json";
+const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
+const DEFAULT_TASK_SUMMARY_MODEL: &str = "qwen3.5:4b";
+const MAX_SESSION_PROMPT_BYTES: usize = 96 * 1024;
+const MAX_TASKS_PROMPT_BYTES: usize = 32 * 1024;
 static SYNC_LOCK: Mutex<()> = Mutex::const_new(());
+static TASK_SUMMARY_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, Serialize, TS)]
 pub struct AiRoomEndpointState {
@@ -82,6 +91,29 @@ struct EndpointFiles {
     files: BTreeMap<String, String>,
     available: bool,
     error: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct TaskSummaryState {
+    processed_sessions: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionTaskSummary {
+    completed: bool,
+    summary: String,
+    next: String,
+    blocked: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaChatResponse {
+    message: OllamaMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaMessage {
+    content: String,
 }
 
 pub async fn list_rooms(
@@ -271,6 +303,20 @@ async fn sync_room_internal(
 }
 
 pub fn spawn_auto_sync(deployment: DeploymentImpl) {
+    let summary_deployment = deployment.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(TASK_SUMMARY_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            let _guard = TASK_SUMMARY_LOCK.lock().await;
+            if let Err(error) = summarize_pending_sessions(&summary_deployment).await {
+                tracing::debug!("AI Room local task summarizer is waiting: {error}");
+            }
+        }
+    });
+
     tokio::spawn(async move {
         match AiRoom::find_all(&deployment.db().pool).await {
             Ok(rooms) => {
@@ -376,7 +422,7 @@ fn normalized_local_path(path: &FsPath) -> String {
 
 fn room_instruction(room: &AiRoom) -> String {
     format!(
-        "# AI Room: {name}\n\nRoom ID: `{id}`\nInstruction version: {version}\n\n## Required session workflow\n\n1. Before doing any work, read `.ai-room/context.md`, `.ai-room/decisions.md`, `.ai-room/tasks.md`, and the newest files in `.ai-room/sessions/`.\n2. Create one new session file named `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<short-id>.md`. Never reuse another session's filename.\n3. Record the goal, assumptions, important commands, files changed, verification results, decisions, blockers, and concrete next steps. Update it during the session, not only at the end.\n4. Treat `tasks.md` as a concise status dashboard. Never edit, delete, or reorder an existing line. Before ending every session, append exactly one line under `## AI session updates` using `- [x] YYYY-MM-DD HH:MM | <agent> | Done: <summary> | Next: <next action> | Blocked: <none or reason> | Session: sessions/<filename>`. Use `[ ]` instead of `[x]` when the session goal is not complete. Keep the entire entry on one line.\n5. Update `context.md` only for durable project facts. Append architectural decisions to `decisions.md`; do not rewrite history.\n6. Never store secrets, tokens, private keys, or raw credentials in room files.\n7. Before ending, make the session file sufficient for another Claude or Codex session to continue without relying on chat history. After all other writes are finished, add `{complete_marker}` as the final line of the session file. The app uses this exact marker to know the session is safe to synchronize and remove from the server.\n\n## Server privacy\n\nWhen this room is prepared on its SSH server, all `.ai-room` files there are temporary. The Task AI Platform automatically copies completed session files and append-only task updates to the local root, then removes the server-side room files after a conflict-free sync. Do not assume earlier session files remain on the server.\n\n## Room endpoints\n\n- Local root: `{local}`\n- Remote root: `{remote}`\n\nThe Task AI Platform manages and synchronizes these records. Claude and Codex perform the project work directly in the selected root.\n",
+        "# AI Room: {name}\n\nRoom ID: `{id}`\nInstruction version: {version}\n\n## Required session workflow\n\n1. Before doing any work, read `.ai-room/context.md`, `.ai-room/decisions.md`, `.ai-room/tasks.md`, and the newest files in `.ai-room/sessions/`.\n2. Create one new session file named `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<short-id>.md`. Never reuse another session's filename.\n3. Record the goal, assumptions, important commands, files changed, verification results, decisions, blockers, and concrete next steps. Update it during the session, not only at the end.\n4. Do not edit the `## AI session updates` section in `tasks.md`. The Task AI Platform reads each completed session locally and appends one validated status line automatically. Make the result, completion state, next action, and blockers explicit in the session file so the local summarizer can report them accurately.\n5. Update `context.md` only for durable project facts. Append architectural decisions to `decisions.md`; do not rewrite history.\n6. Never store secrets, tokens, private keys, or raw credentials in room files.\n7. Before ending, make the session file sufficient for another Claude or Codex session to continue without relying on chat history. After all other writes are finished, add `{complete_marker}` as the final line of the session file. The app uses this exact marker to know the session is safe to synchronize, summarize locally, and remove from the server.\n\n## Server privacy\n\nWhen this room is prepared on its SSH server, all `.ai-room` files there are temporary. The Task AI Platform automatically copies completed session files to the local root, then removes the server-side room files after a conflict-free sync. The local task summarizer uses only the local Ollama service; session contents are not sent to a cloud model. Do not assume earlier session files remain on the server.\n\n## Room endpoints\n\n- Local root: `{local}`\n- Remote root: `{remote}`\n\nThe Task AI Platform manages and synchronizes these records. Claude and Codex perform the project work directly in the selected root.\n",
         name = room.name,
         id = room.id,
         version = INSTRUCTION_VERSION,
@@ -434,7 +480,7 @@ fn initial_files(room: &AiRoom) -> Vec<(String, String)> {
         ),
         (
             "tasks.md".into(),
-            "# Tasks\n\n## Planned work\n\n- [ ] Describe the next concrete task.\n\n## AI session updates\n\n<!-- AI agents append exactly one concise line per session below. -->\n"
+            "# Tasks\n\n## Planned work\n\n- [ ] Describe the next concrete task.\n\n## AI session updates\n\n<!-- The local task summarizer appends one validated line per completed session. -->\n"
                 .into(),
         ),
     ]
@@ -450,12 +496,16 @@ fn all_remote_sessions_complete(files: &BTreeMap<String, String>) -> bool {
         .filter(|(name, _)| name.starts_with("sessions/"))
         .collect::<Vec<_>>();
     !sessions.is_empty()
-        && sessions.iter().all(|(_, content)| {
-            content
-                .lines()
-                .next_back()
-                .is_some_and(|line| line.trim() == SESSION_COMPLETE_MARKER)
-        })
+        && sessions
+            .iter()
+            .all(|(_, content)| session_is_complete(content))
+}
+
+fn session_is_complete(content: &str) -> bool {
+    content
+        .lines()
+        .next_back()
+        .is_some_and(|line| line.trim() == SESSION_COMPLETE_MARKER)
 }
 
 fn ensure_task_update_section(content: &str) -> String {
@@ -463,10 +513,284 @@ fn ensure_task_update_section(content: &str) -> String {
         content.to_string()
     } else {
         format!(
-            "{}\n\n## AI session updates\n\n<!-- AI agents append exactly one concise line per session below. -->\n",
+            "{}\n\n## AI session updates\n\n<!-- The local task summarizer appends one validated line per completed session. -->\n",
             content.trim_end()
         )
     }
+}
+
+async fn summarize_pending_sessions(deployment: &DeploymentImpl) -> Result<(), String> {
+    let rooms = AiRoom::find_all(&deployment.db().pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut first_error = None;
+
+    for room in rooms {
+        if let Err(error) = summarize_next_session(&room).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+
+    first_error.map_or(Ok(()), Err)
+}
+
+async fn summarize_next_session(room: &AiRoom) -> Result<(), String> {
+    let room_dir = PathBuf::from(&room.local_root).join(ROOM_DIR);
+    let tasks_path = room_dir.join("tasks.md");
+    let initial_tasks = fs::read_to_string(&tasks_path)
+        .await
+        .map_err(|error| format!("{} has no readable task list: {error}", room.name))?;
+    let mut state = read_task_summary_state(&room_dir).await;
+    let mut sessions = Vec::new();
+    let mut entries = match fs::read_dir(room_dir.join("sessions")).await {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".md") {
+            continue;
+        }
+        if let Ok(content) = fs::read_to_string(entry.path()).await
+            && content.len() <= MAX_DOCUMENT_BYTES
+            && session_is_complete(&content)
+        {
+            sessions.push((format!("sessions/{name}"), content));
+        }
+    }
+    sessions.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for (filename, content) in sessions {
+        let hash = session_hash(&content);
+        if state.processed_sessions.get(&filename) == Some(&hash) {
+            continue;
+        }
+        if tasks_reference_session(&initial_tasks, &filename) {
+            state.processed_sessions.insert(filename, hash);
+            write_task_summary_state(&room_dir, &state).await?;
+            continue;
+        }
+
+        let task_line = match extract_task_line(&content, &filename) {
+            Some(line) => line,
+            None => {
+                let summary = request_local_task_summary(&content, &initial_tasks).await?;
+                format_task_line(&filename, summary)?
+            }
+        };
+
+        let mut current_tasks = fs::read_to_string(&tasks_path)
+            .await
+            .map_err(|error| format!("Unable to re-read {} tasks: {error}", room.name))?;
+        if !tasks_reference_session(&current_tasks, &filename) {
+            current_tasks = ensure_task_update_section(&current_tasks);
+            if !current_tasks.ends_with('\n') {
+                current_tasks.push('\n');
+            }
+            current_tasks.push_str(&task_line);
+            current_tasks.push('\n');
+            fs::write(&tasks_path, current_tasks)
+                .await
+                .map_err(|error| format!("Unable to update {} tasks: {error}", room.name))?;
+        }
+
+        state.processed_sessions.insert(filename.clone(), hash);
+        write_task_summary_state(&room_dir, &state).await?;
+        tracing::info!(room_id = %room.id, session = filename, "AI Room summarized a completed session locally");
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+async fn read_task_summary_state(room_dir: &FsPath) -> TaskSummaryState {
+    let Ok(content) = fs::read_to_string(room_dir.join(TASK_SUMMARY_STATE_FILE)).await else {
+        return TaskSummaryState::default();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+async fn write_task_summary_state(
+    room_dir: &FsPath,
+    state: &TaskSummaryState,
+) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(state).map_err(|error| error.to_string())?;
+    fs::write(room_dir.join(TASK_SUMMARY_STATE_FILE), content)
+        .await
+        .map_err(|error| format!("Unable to save local task summary state: {error}"))
+}
+
+fn session_hash(content: &str) -> String {
+    format!("{:x}", Sha256::digest(content.as_bytes()))
+}
+
+fn tasks_reference_session(tasks: &str, filename: &str) -> bool {
+    tasks.lines().any(|line| {
+        line.contains("Session:")
+            && line
+                .split('|')
+                .any(|part| part.trim() == format!("Session: {filename}"))
+    })
+}
+
+fn extract_task_line(content: &str, filename: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let candidate = line.trim();
+        if candidate.len() > 1_024
+            || !candidate.starts_with("- [")
+            || !candidate.contains("| Done:")
+            || !candidate.contains("| Next:")
+            || !candidate.contains("| Blocked:")
+        {
+            return None;
+        }
+        if candidate.contains("| Session:") && !tasks_reference_session(candidate, filename) {
+            return None;
+        }
+        let without_session = candidate.split("| Session:").next()?.trim_end();
+        Some(format!("{without_session} | Session: {filename}"))
+    })
+}
+
+async fn request_local_task_summary(
+    session: &str,
+    tasks: &str,
+) -> Result<SessionTaskSummary, String> {
+    let base_url = env::var("TASK_AI_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.into());
+    let model =
+        env::var("TASK_AI_SUMMARY_MODEL").unwrap_or_else(|_| DEFAULT_TASK_SUMMARY_MODEL.into());
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "completed": { "type": "boolean" },
+            "summary": { "type": "string" },
+            "next": { "type": "string" },
+            "blocked": { "type": "string" }
+        },
+        "required": ["completed", "summary", "next", "blocked"],
+        "additionalProperties": false
+    });
+    let prompt = format!(
+        "You maintain a concise project task dashboard from a completed AI coding session. Use only facts in the session. Return the requested JSON schema. Write in the session's main language. `completed` means the session goal was achieved, not merely that the session ended. Keep summary under 180 characters, next under 140, and blocked under 100. Use `none` when there is no next action or blocker. Do not include markdown or pipe characters.\n\nCURRENT TASKS:\n{}\n\nCOMPLETED SESSION:\n{}",
+        bounded_text(tasks, MAX_TASKS_PROMPT_BYTES),
+        bounded_text(session, MAX_SESSION_PROMPT_BYTES)
+    );
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .post(format!("{}/api/chat", base_url.trim_end_matches('/')))
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": prompt }],
+            "format": schema,
+            "stream": false,
+            "think": false,
+            "keep_alive": "5m",
+            "options": { "temperature": 0 }
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("Local Ollama is unavailable: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("Unable to read Ollama response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Ollama rejected task summarization ({status}): {}",
+            bounded_text(&body, 300)
+        ));
+    }
+    let response: OllamaChatResponse =
+        serde_json::from_str(&body).map_err(|error| format!("Invalid Ollama response: {error}"))?;
+    serde_json::from_str(response.message.content.trim())
+        .map_err(|error| format!("Ollama returned invalid task summary JSON: {error}"))
+}
+
+fn bounded_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let head_bytes = max_bytes * 3 / 4;
+    let tail_bytes = max_bytes - head_bytes;
+    let mut head_end = head_bytes;
+    while !value.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = value.len() - tail_bytes;
+    while !value.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n...[truncated]...\n{}",
+        &value[..head_end],
+        &value[tail_start..]
+    )
+}
+
+fn clean_summary_field(value: &str, max_chars: usize, fallback: &str) -> String {
+    let cleaned = value
+        .replace('|', "/")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let result = if cleaned.is_empty() {
+        fallback
+    } else {
+        &cleaned
+    };
+    result.chars().take(max_chars).collect()
+}
+
+fn format_task_line(filename: &str, summary: SessionTaskSummary) -> Result<String, String> {
+    let done = clean_summary_field(&summary.summary, 180, "");
+    if done.is_empty() {
+        return Err("Local model returned an empty task summary".into());
+    }
+    let next = clean_summary_field(&summary.next, 140, "none");
+    let blocked = clean_summary_field(&summary.blocked, 100, "none");
+    let checkbox = if summary.completed { "x" } else { " " };
+    let (timestamp, agent) = session_identity(filename);
+    Ok(format!(
+        "- [{checkbox}] {timestamp} | {agent} | Done: {done} | Next: {next} | Blocked: {blocked} | Session: {filename}"
+    ))
+}
+
+fn session_identity(filename: &str) -> (String, String) {
+    let stem = filename
+        .strip_prefix("sessions/")
+        .and_then(|value| value.strip_suffix(".md"))
+        .unwrap_or(filename);
+    let mut parts = stem.split('-');
+    let date = parts.next().unwrap_or_default();
+    let time = parts.next().unwrap_or_default();
+    let agent = clean_summary_field(parts.next().unwrap_or("ai"), 32, "ai");
+    let timestamp = if date.len() == 8
+        && time.len() == 6
+        && date
+            .chars()
+            .chain(time.chars())
+            .all(|value| value.is_ascii_digit())
+    {
+        format!(
+            "{}-{}-{} {}:{}",
+            &date[0..4],
+            &date[4..6],
+            &date[6..8],
+            &time[0..2],
+            &time[2..4]
+        )
+    } else {
+        "unknown-time".into()
+    };
+    (timestamp, agent)
 }
 
 async fn initialize_local(room: &AiRoom) -> Result<(), ApiError> {
@@ -938,5 +1262,48 @@ mod tests {
         assert!(migrated.starts_with(original.trim_end()));
         assert!(migrated.contains("## AI session updates"));
         assert_eq!(ensure_task_update_section(&migrated), migrated);
+    }
+
+    #[test]
+    fn recognizes_only_the_exact_session_reference() {
+        let tasks = "- [x] done | Session: sessions/one.md\n";
+        assert!(tasks_reference_session(tasks, "sessions/one.md"));
+        assert!(!tasks_reference_session(tasks, "sessions/two.md"));
+    }
+
+    #[test]
+    fn reuses_a_valid_task_line_from_the_session() {
+        let content = "notes\n- [x] 2026-07-23 10:20 | codex | Done: fixed sync | Next: none | Blocked: none\n";
+        assert_eq!(
+            extract_task_line(content, "sessions/20260723-102000-codex-a1.md").unwrap(),
+            "- [x] 2026-07-23 10:20 | codex | Done: fixed sync | Next: none | Blocked: none | Session: sessions/20260723-102000-codex-a1.md"
+        );
+    }
+
+    #[test]
+    fn formats_and_sanitizes_model_task_summary() {
+        let line = format_task_line(
+            "sessions/20260723-102030-claude-a1.md",
+            SessionTaskSummary {
+                completed: false,
+                summary: "implemented | verified\nlocally".into(),
+                next: "run tests".into(),
+                blocked: "".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            "- [ ] 2026-07-23 10:20 | claude | Done: implemented / verified locally | Next: run tests | Blocked: none | Session: sessions/20260723-102030-claude-a1.md"
+        );
+    }
+
+    #[test]
+    fn bounds_utf8_prompt_without_breaking_characters() {
+        let source = "가나다라마바사아자차카타파하";
+        let bounded = bounded_text(source, 18);
+        assert!(bounded.starts_with("가나다"));
+        assert!(bounded.contains("...[truncated]..."));
+        assert!(bounded.ends_with('하'));
     }
 }

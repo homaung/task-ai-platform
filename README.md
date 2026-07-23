@@ -23,7 +23,7 @@ app manages those records rather than proxying an AI chat.
 - Server sessions use an explicit prepare step followed by automatic synchronization and clean-up
 - Local-only final retention after a conflict-free server synchronization
 - Conflict preservation: differing records are never overwritten or deleted
-- One append-only task-status line per completed AI session
+- Local Qwen summarizer adds one validated, append-only task-status line per completed AI session
 - Completion markers prevent automatic cleanup while an AI session is still active
 - Shared context, decisions, tasks, and session history viewer/editor
 - Existing Vibe Kanban foundations retained as a compatibility layer
@@ -74,6 +74,21 @@ Create a room from the desktop app:
 6. Leave the local app running. It detects completed server session records,
    copies them locally, and removes the temporary server room automatically.
    **Synchronize now** remains available as a recovery action.
+
+The app summarizes completed session files through a local Ollama service and
+never sends their contents to a cloud model. On each Windows computer, install
+Ollama and the default model once:
+
+```powershell
+winget install --id Ollama.Ollama -e
+ollama pull qwen3.5:4b
+```
+
+The summarizer checks completed sessions in the background, validates the
+model's structured result, and appends one line to `tasks.md`. Processed session
+hashes are stored locally in `.ai-room/task-summary-state.json` to prevent
+duplicates. If Ollama is temporarily unavailable, the session remains pending
+and is retried automatically; synchronization and normal room use continue.
 
 If a conflict is detected, the app deliberately leaves the server copy in place
 so no record is lost. Resolve the conflict and synchronize again to finish the
