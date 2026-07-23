@@ -26,11 +26,12 @@ use crate::{
 };
 
 const ROOM_DIR: &str = ".ai-room";
-const INSTRUCTION_VERSION: i64 = 1;
+const INSTRUCTION_VERSION: i64 = 2;
 const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
 const CLEAR_SEND_ENV: &str = "SendEnv=-*";
 const START_MARKER: &str = "<!-- task-ai-room:start -->";
 const END_MARKER: &str = "<!-- task-ai-room:end -->";
+const SESSION_COMPLETE_MARKER: &str = "<!-- task-ai-room:complete -->";
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(15);
 static SYNC_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -230,12 +231,24 @@ async fn sync_room_internal(
             }
         }
 
-        for document in ["context.md", "decisions.md", "tasks.md"] {
+        for document in ["context.md", "decisions.md"] {
             if let (Some(left), Some(right)) =
                 (local.files.get(document), remote.files.get(document))
                 && left != right
             {
                 conflicts.push(document.to_string());
+            }
+        }
+
+        if let (Some(local_tasks), Some(remote_tasks)) =
+            (local.files.get("tasks.md"), remote.files.get("tasks.md"))
+            && local_tasks != remote_tasks
+        {
+            if is_append_only_update(local_tasks, remote_tasks) {
+                write_local_file(&room, "tasks.md", remote_tasks).await?;
+                copied_to_local.push("tasks.md".into());
+            } else {
+                conflicts.push("tasks.md".into());
             }
         }
 
@@ -259,6 +272,22 @@ async fn sync_room_internal(
 
 pub fn spawn_auto_sync(deployment: DeploymentImpl) {
     tokio::spawn(async move {
+        match AiRoom::find_all(&deployment.db().pool).await {
+            Ok(rooms) => {
+                for room in rooms {
+                    if let Err(error) = initialize_local(&room).await {
+                        tracing::warn!(
+                            room_id = %room.id,
+                            "AI Room instructions could not be upgraded: {error}"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!("AI Room instruction upgrade could not list rooms: {error}");
+            }
+        }
+
         let mut interval = tokio::time::interval(AUTO_SYNC_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
@@ -278,12 +307,9 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
                 .filter(|room| room.ssh_alias.is_some() && room.remote_root.is_some())
             {
                 let remote = read_remote_files(&room).await;
-                let has_remote_session = remote.available
-                    && remote
-                        .files
-                        .keys()
-                        .any(|name| name.starts_with("sessions/"));
-                if !has_remote_session {
+                let sessions_are_complete =
+                    remote.available && all_remote_sessions_complete(&remote.files);
+                if !sessions_are_complete {
                     continue;
                 }
 
@@ -350,10 +376,11 @@ fn normalized_local_path(path: &FsPath) -> String {
 
 fn room_instruction(room: &AiRoom) -> String {
     format!(
-        "# AI Room: {name}\n\nRoom ID: `{id}`\nInstruction version: {version}\n\n## Required session workflow\n\n1. Before doing any work, read `.ai-room/context.md`, `.ai-room/decisions.md`, `.ai-room/tasks.md`, and the newest files in `.ai-room/sessions/`.\n2. Create one new session file named `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<short-id>.md`. Never reuse another session's filename.\n3. Record the goal, assumptions, important commands, files changed, verification results, decisions, blockers, and concrete next steps. Update it during the session, not only at the end.\n4. Update `tasks.md` when task status changes. Update `context.md` only for durable project facts. Append architectural decisions to `decisions.md`; do not rewrite history.\n5. Never store secrets, tokens, private keys, or raw credentials in room files.\n6. Before ending, make the session file sufficient for another Claude or Codex session to continue without relying on chat history.\n\n## Server privacy\n\nWhen this room is prepared on its SSH server, all `.ai-room` files there are temporary. The Task AI Platform copies completed session files to the local root and removes the server-side room files after a conflict-free sync. Do not assume earlier session files remain on the server.\n\n## Room endpoints\n\n- Local root: `{local}`\n- Remote root: `{remote}`\n\nThe Task AI Platform manages and synchronizes these records. Claude and Codex perform the project work directly in the selected root.\n",
+        "# AI Room: {name}\n\nRoom ID: `{id}`\nInstruction version: {version}\n\n## Required session workflow\n\n1. Before doing any work, read `.ai-room/context.md`, `.ai-room/decisions.md`, `.ai-room/tasks.md`, and the newest files in `.ai-room/sessions/`.\n2. Create one new session file named `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<short-id>.md`. Never reuse another session's filename.\n3. Record the goal, assumptions, important commands, files changed, verification results, decisions, blockers, and concrete next steps. Update it during the session, not only at the end.\n4. Treat `tasks.md` as a concise status dashboard. Never edit, delete, or reorder an existing line. Before ending every session, append exactly one line under `## AI session updates` using `- [x] YYYY-MM-DD HH:MM | <agent> | Done: <summary> | Next: <next action> | Blocked: <none or reason> | Session: sessions/<filename>`. Use `[ ]` instead of `[x]` when the session goal is not complete. Keep the entire entry on one line.\n5. Update `context.md` only for durable project facts. Append architectural decisions to `decisions.md`; do not rewrite history.\n6. Never store secrets, tokens, private keys, or raw credentials in room files.\n7. Before ending, make the session file sufficient for another Claude or Codex session to continue without relying on chat history. After all other writes are finished, add `{complete_marker}` as the final line of the session file. The app uses this exact marker to know the session is safe to synchronize and remove from the server.\n\n## Server privacy\n\nWhen this room is prepared on its SSH server, all `.ai-room` files there are temporary. The Task AI Platform automatically copies completed session files and append-only task updates to the local root, then removes the server-side room files after a conflict-free sync. Do not assume earlier session files remain on the server.\n\n## Room endpoints\n\n- Local root: `{local}`\n- Remote root: `{remote}`\n\nThe Task AI Platform manages and synchronizes these records. Claude and Codex perform the project work directly in the selected root.\n",
         name = room.name,
         id = room.id,
         version = INSTRUCTION_VERSION,
+        complete_marker = SESSION_COMPLETE_MARKER,
         local = room.local_root,
         remote = room
             .ssh_alias
@@ -407,9 +434,39 @@ fn initial_files(room: &AiRoom) -> Vec<(String, String)> {
         ),
         (
             "tasks.md".into(),
-            "# Tasks\n\n- [ ] Describe the next concrete task.\n".into(),
+            "# Tasks\n\n## Planned work\n\n- [ ] Describe the next concrete task.\n\n## AI session updates\n\n<!-- AI agents append exactly one concise line per session below. -->\n"
+                .into(),
         ),
     ]
+}
+
+fn is_append_only_update(local: &str, remote: &str) -> bool {
+    remote.len() > local.len() && remote.starts_with(local)
+}
+
+fn all_remote_sessions_complete(files: &BTreeMap<String, String>) -> bool {
+    let sessions = files
+        .iter()
+        .filter(|(name, _)| name.starts_with("sessions/"))
+        .collect::<Vec<_>>();
+    !sessions.is_empty()
+        && sessions.iter().all(|(_, content)| {
+            content
+                .lines()
+                .next_back()
+                .is_some_and(|line| line.trim() == SESSION_COMPLETE_MARKER)
+        })
+}
+
+fn ensure_task_update_section(content: &str) -> String {
+    if content.contains("## AI session updates") {
+        content.to_string()
+    } else {
+        format!(
+            "{}\n\n## AI session updates\n\n<!-- AI agents append exactly one concise line per session below. -->\n",
+            content.trim_end()
+        )
+    }
 }
 
 async fn initialize_local(room: &AiRoom) -> Result<(), ApiError> {
@@ -424,6 +481,12 @@ async fn initialize_local(room: &AiRoom) -> Result<(), ApiError> {
         {
             fs::write(path, content).await?;
         }
+    }
+    let tasks_path = room_dir.join("tasks.md");
+    let tasks = fs::read_to_string(&tasks_path).await.unwrap_or_default();
+    let migrated_tasks = ensure_task_update_section(&tasks);
+    if migrated_tasks != tasks {
+        fs::write(tasks_path, migrated_tasks).await?;
     }
     let block = managed_agent_block(room);
     for filename in ["AGENTS.md", "CLAUDE.md"] {
@@ -833,5 +896,47 @@ mod tests {
             normalized_local_path(FsPath::new(r"\\?\UNC\server\share\project")),
             r"\\server\share\project"
         );
+    }
+
+    #[test]
+    fn accepts_only_append_only_task_updates() {
+        let local = "# Tasks\n\n## AI session updates\n";
+        assert!(is_append_only_update(
+            local,
+            &format!("{local}- [x] one completed session\n")
+        ));
+        assert!(!is_append_only_update(
+            local,
+            "# Tasks\n\nrewritten content\n"
+        ));
+        assert!(!is_append_only_update(local, local));
+    }
+
+    #[test]
+    fn waits_until_every_remote_session_is_complete() {
+        let mut files = BTreeMap::new();
+        files.insert("tasks.md".into(), "# Tasks".into());
+        assert!(!all_remote_sessions_complete(&files));
+
+        files.insert(
+            "sessions/one.md".into(),
+            format!("finished\n{SESSION_COMPLETE_MARKER}\n"),
+        );
+        assert!(all_remote_sessions_complete(&files));
+
+        files.insert(
+            "sessions/two.md".into(),
+            format!("{SESSION_COMPLETE_MARKER}\nstill working"),
+        );
+        assert!(!all_remote_sessions_complete(&files));
+    }
+
+    #[test]
+    fn adds_task_update_section_without_rewriting_existing_tasks() {
+        let original = "# Tasks\n\n- [ ] User task\n";
+        let migrated = ensure_task_update_section(original);
+        assert!(migrated.starts_with(original.trim_end()));
+        assert!(migrated.contains("## AI session updates"));
+        assert_eq!(ensure_task_update_section(&migrated), migrated);
     }
 }

@@ -23,6 +23,8 @@ app manages those records rather than proxying an AI chat.
 - Server sessions use an explicit prepare step followed by automatic synchronization and clean-up
 - Local-only final retention after a conflict-free server synchronization
 - Conflict preservation: differing records are never overwritten or deleted
+- One append-only task-status line per completed AI session
+- Completion markers prevent automatic cleanup while an AI session is still active
 - Shared context, decisions, tasks, and session history viewer/editor
 - Existing Vibe Kanban foundations retained as a compatibility layer
 
