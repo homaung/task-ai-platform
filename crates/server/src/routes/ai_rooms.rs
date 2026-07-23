@@ -1376,6 +1376,34 @@ async fn build_snapshot(room: AiRoom) -> AiRoomSnapshot {
     let baseline = library_baseline(&remote.files);
     let remote_library = remote_library_documents(&remote.files);
     let mut library = Vec::new();
+    for filename in ["ROOM.md", "context.md", "decisions.md", "tasks.md"] {
+        match (local.files.get(filename), remote.files.get(filename)) {
+            (Some(left), Some(right)) if left == right => library.push(AiRoomRecord {
+                filename: filename.into(),
+                content: left.clone(),
+                source: "both".into(),
+            }),
+            (Some(left), Some(_)) => {
+                conflicts.push(filename.into());
+                library.push(AiRoomRecord {
+                    filename: filename.into(),
+                    content: left.clone(),
+                    source: "conflict".into(),
+                });
+            }
+            (Some(content), None) => library.push(AiRoomRecord {
+                filename: filename.into(),
+                content: content.clone(),
+                source: "local".into(),
+            }),
+            (None, Some(content)) => library.push(AiRoomRecord {
+                filename: filename.into(),
+                content: content.clone(),
+                source: "remote".into(),
+            }),
+            _ => {}
+        }
+    }
     let mut library_names = local
         .files
         .keys()

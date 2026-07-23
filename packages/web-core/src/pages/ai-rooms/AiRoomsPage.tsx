@@ -28,6 +28,12 @@ const DOCUMENTS: Array<{ kind: DocumentKind; label: string }> = [
   { kind: 'tasks', label: '작업 목록' },
 ];
 
+const MANAGED_ROOM_DOCUMENTS: Partial<Record<string, DocumentKind>> = {
+  'context.md': 'context',
+  'decisions.md': 'decisions',
+  'tasks.md': 'tasks',
+};
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
@@ -335,11 +341,18 @@ export function AiRoomsPage() {
     setBusy(true);
     setError(null);
     try {
-      const next = await aiRoomsApi.updateLibraryFile(
-        selectedRoomId,
-        activeLibrary.filename.replace('library/', ''),
-        libraryDraft
-      );
+      const managedKind = MANAGED_ROOM_DOCUMENTS[activeLibrary.filename];
+      const next = managedKind
+        ? await aiRoomsApi.updateDocument(
+            selectedRoomId,
+            managedKind,
+            libraryDraft
+          )
+        : await aiRoomsApi.updateLibraryFile(
+            selectedRoomId,
+            activeLibrary.filename.replace('library/', ''),
+            libraryDraft
+          );
       setSnapshot(next);
       setNotice('룸 문서를 로컬 프로젝트에 저장했습니다.');
     } catch (reason) {
@@ -350,7 +363,12 @@ export function AiRoomsPage() {
   };
 
   const deleteLibraryFile = async () => {
-    if (!selectedRoomId || !activeLibrary) return;
+    if (
+      !selectedRoomId ||
+      !activeLibrary ||
+      !activeLibrary.filename.startsWith('library/')
+    )
+      return;
     const filename = activeLibrary.filename.replace('library/', '');
     if (!window.confirm(`'${filename}' 룸 문서를 삭제할까요?`)) return;
 
@@ -804,7 +822,9 @@ export function AiRoomsPage() {
                     <textarea
                       value={libraryDraft}
                       onChange={(event) => setLibraryDraft(event.target.value)}
-                      disabled={!activeLibrary}
+                      disabled={
+                        !activeLibrary || activeLibrary.filename === 'ROOM.md'
+                      }
                       spellCheck={false}
                       placeholder="선택한 룸 문서의 내용이 여기에 표시됩니다."
                       className="min-h-0 flex-1 resize-none bg-transparent p-4 font-mono text-xs leading-5 text-normal outline-none disabled:opacity-50"
@@ -812,7 +832,11 @@ export function AiRoomsPage() {
                     <div className="flex justify-between gap-2 border-t border-border p-3">
                       <button
                         type="button"
-                        disabled={busy || !activeLibrary}
+                        disabled={
+                          busy ||
+                          !activeLibrary ||
+                          !activeLibrary.filename.startsWith('library/')
+                        }
                         onClick={() => void deleteLibraryFile()}
                         className="flex items-center gap-1 rounded-md border border-red-500/40 px-3 py-1.5 text-sm text-red-400 hover:bg-red-500/10 disabled:opacity-40"
                       >
@@ -823,6 +847,7 @@ export function AiRoomsPage() {
                         disabled={
                           busy ||
                           !activeLibrary ||
+                          activeLibrary.filename === 'ROOM.md' ||
                           libraryDraft === activeLibrary.content
                         }
                         onClick={() => void saveLibraryFile()}
