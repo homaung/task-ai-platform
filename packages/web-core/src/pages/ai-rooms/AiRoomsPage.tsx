@@ -22,10 +22,14 @@ import { cn } from '@/shared/lib/utils';
 
 type DocumentKind = 'context' | 'decisions' | 'tasks';
 
-const DOCUMENTS: Array<{ kind: DocumentKind; label: string }> = [
-  { kind: 'context', label: '프로젝트 맥락' },
-  { kind: 'decisions', label: '결정 기록' },
-  { kind: 'tasks', label: '작업 목록' },
+const DOCUMENTS: Array<{
+  kind: DocumentKind;
+  label: string;
+  managed: boolean;
+}> = [
+  { kind: 'context', label: '프로젝트 맥락', managed: false },
+  { kind: 'decisions', label: '결정 기록', managed: true },
+  { kind: 'tasks', label: '작업 목록', managed: true },
 ];
 
 const MANAGED_ROOM_DOCUMENTS: Partial<Record<string, DocumentKind>> = {
@@ -230,7 +234,9 @@ export function AiRoomsPage() {
       setNotice(
         result.conflicts.length
           ? `${result.copied_to_local.length}개 기록을 로컬로 복사했고 ${result.conflicts.length}개 충돌은 서버에 보존했습니다.`
-          : `${result.copied_to_local.length}개 새 세션 기록을 로컬로 가져오고 서버의 임시 기록을 삭제했습니다.`
+          : result.removed_from_remote.length
+            ? `${result.copied_to_local.length}개 기록을 로컬로 가져오고 완료된 서버 임시 기록을 삭제했습니다.`
+            : `${result.copied_to_local.length}개 진행 중 체크포인트를 로컬로 복사했습니다. 서버 원본은 유지됩니다.`
       );
     } catch (reason) {
       setError(errorMessage(reason));
@@ -267,7 +273,7 @@ export function AiRoomsPage() {
     try {
       setSnapshot(await aiRoomsApi.prepareRemote(selectedRoomId));
       setNotice(
-        '서버에 이번 작업용 임시 설명서와 공용 맥락을 준비했습니다. 작업 기록이 생기면 앱이 자동으로 동기화하고 서버를 정리합니다.'
+        '서버 설명서를 현재 규칙으로 안전하게 갱신했습니다. 진행 중 기록은 보존하며 완료 뒤에만 정리합니다.'
       );
     } catch (reason) {
       setError(errorMessage(reason));
@@ -277,7 +283,7 @@ export function AiRoomsPage() {
   };
 
   const saveDocument = async () => {
-    if (!selectedRoomId) return;
+    if (!selectedRoomId || selectedDocument !== 'context') return;
     setBusy(true);
     setError(null);
     try {
@@ -288,6 +294,29 @@ export function AiRoomsPage() {
       );
       setSnapshot(next);
       setNotice('공용 문서를 로컬 프로젝트에 저장했습니다.');
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const updateSessionStatus = async (status: 'stopped' | null) => {
+    if (!selectedRoomId || !activeSession) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await aiRoomsApi.updateSessionStatus(
+        selectedRoomId,
+        activeSession.filename,
+        status
+      );
+      setSnapshot(next);
+      setNotice(
+        status === 'stopped'
+          ? '이 세션을 중단으로 표시했습니다. 자동 작업 목록에서 제외됩니다.'
+          : '세션 중단 표시를 해제했습니다.'
+      );
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -612,15 +641,13 @@ export function AiRoomsPage() {
                 </button>
                 {snapshot.remote.configured && (
                   <button
-                    disabled={
-                      busy ||
-                      (snapshot.remote.instruction_installed &&
-                        snapshot.remote.available)
-                    }
+                    disabled={busy}
                     onClick={() => void prepareRemote()}
                     className="rounded-md border border-border px-3 py-2 text-sm hover:bg-secondary disabled:opacity-50"
                   >
-                    서버 작업 준비
+                    {snapshot.remote.instruction_installed
+                      ? '서버 설명서 갱신'
+                      : '서버 작업 준비'}
                   </button>
                 )}
                 <button
@@ -684,13 +711,14 @@ export function AiRoomsPage() {
                     이 앱에서 채팅하지 않습니다. 로컬에서는 Claude 또는 Codex를
                     바로 실행하세요. 서버에서 작업할 때는 먼저{' '}
                     <strong>서버 작업 준비</strong>을 누른 뒤 서버 프로젝트
-                    루트에서 실행합니다. 작업이 끝나 세션 기록이 생기면 앱이
-                    자동으로 로컬에 보관합니다. AI에게 작업 방식, 규칙, 절차를
+                    루트에서 실행합니다. 작업 중 체크포인트는 서버에서 삭제하지
+                    않고 자동으로 로컬에 복사됩니다. 2분간 기록이 안정되면 작업
+                    목록과 결정 기록을 로컬 AI가 갱신합니다. AI에게 작업 방식,
+                    규칙, 절차를
                     룸에 저장하라고 하면 <code>.ai-room/library</code>에 문서로
                     남고 오른쪽의 <strong>룸 문서</strong> 목록에 나타납니다.
-                    동기화가 끝나면 서버의 임시 <code>.ai-room</code> 파일과
-                    관리 안내를 삭제합니다. <strong>지금 동기화</strong>는
-                    복구가 필요할 때만 사용하세요.
+                    모든 세션이 완료된 뒤에만 서버의 임시{' '}
+                    <code>.ai-room</code> 파일을 삭제합니다.
                   </p>
                 </div>
               </div>
@@ -718,19 +746,21 @@ export function AiRoomsPage() {
                   <button
                     disabled={
                       busy ||
+                      selectedDocument !== 'context' ||
                       draft === documentContent(snapshot, selectedDocument)
                     }
                     onClick={() => void saveDocument()}
                     className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-primary disabled:opacity-40"
                   >
-                    저장
+                    {selectedDocument === 'context' ? '저장' : 'AI 자동 관리'}
                   </button>
                 </div>
                 <textarea
                   value={draft}
                   onChange={(event) => setDraft(event.target.value)}
+                  readOnly={selectedDocument !== 'context'}
                   spellCheck={false}
-                  className="min-h-[440px] flex-1 resize-none bg-transparent p-4 font-mono text-sm leading-6 text-normal outline-none"
+                  className="min-h-[440px] flex-1 resize-none bg-transparent p-4 font-mono text-sm leading-6 text-normal outline-none read-only:opacity-80"
                 />
               </section>
 
@@ -823,7 +853,10 @@ export function AiRoomsPage() {
                       value={libraryDraft}
                       onChange={(event) => setLibraryDraft(event.target.value)}
                       disabled={
-                        !activeLibrary || activeLibrary.filename === 'ROOM.md'
+                        !activeLibrary ||
+                        activeLibrary.filename === 'ROOM.md' ||
+                        activeLibrary.filename === 'decisions.md' ||
+                        activeLibrary.filename === 'tasks.md'
                       }
                       spellCheck={false}
                       placeholder="선택한 룸 문서의 내용이 여기에 표시됩니다."
@@ -848,6 +881,8 @@ export function AiRoomsPage() {
                           busy ||
                           !activeLibrary ||
                           activeLibrary.filename === 'ROOM.md' ||
+                          activeLibrary.filename === 'decisions.md' ||
+                          activeLibrary.filename === 'tasks.md' ||
                           libraryDraft === activeLibrary.content
                         }
                         onClick={() => void saveLibraryFile()}
@@ -878,6 +913,8 @@ export function AiRoomsPage() {
                             {session.source === 'both'
                               ? '로컬 + 서버'
                               : session.source}
+                            {snapshot.session_overrides[session.filename] ===
+                              'stopped' && ' · 중단됨'}
                           </p>
                         </button>
                       ))}
@@ -891,6 +928,30 @@ export function AiRoomsPage() {
                       {activeSession?.content ||
                         'Claude 또는 Codex가 첫 작업을 시작하면 여기에 기록이 나타납니다.'}
                     </pre>
+                    {activeSession && (
+                      <div className="flex justify-end border-t border-border p-3">
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() =>
+                            void updateSessionStatus(
+                              snapshot.session_overrides[
+                                activeSession.filename
+                              ] === 'stopped'
+                                ? null
+                                : 'stopped'
+                            )
+                          }
+                          className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-primary disabled:opacity-40"
+                        >
+                          {snapshot.session_overrides[
+                            activeSession.filename
+                          ] === 'stopped'
+                            ? '중단 표시 해제'
+                            : '강제 종료·중단 처리'}
+                        </button>
+                      </div>
+                    )}
                   </>
                 )}
               </section>

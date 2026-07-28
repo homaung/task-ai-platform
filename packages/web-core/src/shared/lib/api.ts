@@ -5,6 +5,7 @@ import {
   AiRoomSnapshot,
   CreateAiRoom,
   SyncAiRoomResponse,
+  UpdateAiRoomSessionStatusRequest,
   ApprovalStatus,
   ApiResponse,
   Config,
@@ -1890,6 +1891,22 @@ export const aiRoomsApi = {
       {
         method: 'PUT',
         body: JSON.stringify({ content }),
+      }
+    );
+    return handleApiResponse<AiRoomSnapshot>(response);
+  },
+
+  updateSessionStatus: async (
+    roomId: string,
+    filename: string,
+    status: 'stopped' | null
+  ): Promise<AiRoomSnapshot> => {
+    const payload: UpdateAiRoomSessionStatusRequest = { filename, status };
+    const response = await makeRequest(
+      `/api/ai-rooms/${roomId}/session-status`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
       }
     );
     return handleApiResponse<AiRoomSnapshot>(response);

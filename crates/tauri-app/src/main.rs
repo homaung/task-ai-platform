@@ -1,6 +1,8 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(target_os = "windows")]
+use std::{os::windows::process::CommandExt, process::Command};
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -8,9 +10,11 @@ use services::services::{
     config::load_config_from_file,
     notification::{NotificationService, PushNotifier, set_global_push_notifier},
 };
-#[cfg(target_os = "macos")]
-use tauri::Manager;
-use tauri::{Emitter, Listener};
+use tauri::{
+    Emitter, Listener, Manager,
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
@@ -22,11 +26,19 @@ use utils::{
     sentry::{self as sentry_utils, SentrySource, sentry_layer},
 };
 use uuid::Uuid;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE},
+    System::Threading::CreateMutexW,
+    UI::WindowsAndMessaging::{FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow},
+};
 
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 // Local builds do not have a published update endpoint. Enabling the updater
 // with the placeholder URL makes Tauri abort before the first window opens.
 const UPDATES_ENABLED: bool = false;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// Native push notifier using Tauri's notification plugin.
 /// Emits a `navigate-to-workspace` event so the frontend can navigate to the
@@ -73,6 +85,11 @@ impl PushNotifier for TauriNotifier {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    let Some(_instance_mutex) = acquire_single_instance() else {
+        return;
+    };
+
     // Install rustls crypto provider before any TLS operations
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
@@ -80,7 +97,7 @@ fn main() {
 
     let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     let filter_string = format!(
-        "warn,server={level},services={level},db={level},executors={level},deployment={level},local_deployment={level},utils={level},vibe_kanban_tauri={level}",
+        "warn,server={level},services={level},db={level},executors={level},deployment={level},local_deployment={level},utils={level},task_ai_platform={level}",
         level = log_level
     );
     let env_filter = EnvFilter::try_new(filter_string).expect("Failed to create tracing filter");
@@ -101,6 +118,7 @@ fn main() {
     let pending_update: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     let pending_for_setup = pending_update.clone();
     let pending_for_exit = pending_update.clone();
+    let start_hidden = std::env::args().any(|argument| argument == "--background");
 
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -119,6 +137,7 @@ fn main() {
 
     builder
         .setup(move |app| {
+            install_tray(app)?;
             if cfg!(debug_assertions) {
                 // Dev mode: frontend dev server (Vite) and backend are started
                 // externally. Use WebviewUrl::External so that macOS WKWebView
@@ -132,6 +151,9 @@ fn main() {
                 disable_pinch_zoom(&window);
                 let _ = window;
             } else {
+                #[cfg(target_os = "windows")]
+                ensure_windows_autostart();
+
                 // Production: start the Axum server first, then open the window
                 // once it's ready so the user never sees a blank/error page.
                 let app_handle = app.handle().clone();
@@ -158,12 +180,18 @@ fn main() {
                                     Ok(window) => {
                                         #[cfg(target_os = "macos")]
                                         disable_pinch_zoom(&window);
-                                        let _ = window;
+                                        if start_hidden {
+                                            let _ = window.hide();
+                                        }
                                     }
                                     Err(e) => tracing::error!("Failed to create window: {e}"),
                                 }
                             });
-                            tracing::info!("Window opened at {url}");
+                            if !start_hidden {
+                                tracing::info!("Window opened at {url}");
+                            } else {
+                                tracing::info!("Task AI Platform started in the background");
+                            }
 
                             // Wait for either the server to exit on its own or
                             // the external shutdown token to be cancelled.
@@ -217,11 +245,7 @@ fn main() {
         })
         .on_window_event(move |_window, event| {
             match event {
-                #[cfg(target_os = "macos")]
                 tauri::WindowEvent::CloseRequested { api, .. } => {
-                    // macOS keeps the app alive and reopens it from the dock.
-                    // Windows closes normally so the desktop shortcut can
-                    // launch a fresh visible window next time.
                     api.prevent_close();
                     let _ = _window.hide();
                 }
@@ -251,6 +275,99 @@ fn main() {
         });
 }
 
+#[cfg(target_os = "windows")]
+fn acquire_single_instance() -> Option<HANDLE> {
+    let name = "TaskAIPlatform.LocalRoomManager\0"
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Some(handle);
+    }
+    if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+        return Some(handle);
+    }
+
+    let title = "Task AI Platform\0".encode_utf16().collect::<Vec<_>>();
+    let window = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+    if !window.is_null() {
+        unsafe {
+            ShowWindow(window, SW_RESTORE);
+            SetForegroundWindow(window);
+        }
+    }
+    unsafe {
+        CloseHandle(handle);
+    }
+    None
+}
+
+fn install_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "Task AI Platform 열기", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "완전히 종료", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let mut builder = TrayIconBuilder::new()
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .tooltip("Task AI Platform — AI Room 동기화 실행 중")
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                show_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_autostart() {
+    let Ok(executable) = std::env::current_exe() else {
+        tracing::warn!("Unable to determine executable path for Windows autostart");
+        return;
+    };
+    let command_line = format!("\"{}\" --background", executable.display());
+    match Command::new("reg.exe")
+        .args([
+            "add",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            "Task AI Platform",
+            "/t",
+            "REG_SZ",
+            "/d",
+            &command_line,
+            "/f",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+    {
+        Ok(status) if status.success() => {
+            tracing::info!("Windows login autostart is enabled");
+        }
+        Ok(status) => {
+            tracing::warn!("Windows autostart registration failed with {status}");
+        }
+        Err(error) => {
+            tracing::warn!("Windows autostart registration failed: {error}");
+        }
+    }
+}
+
 /// Disable trackpad/touchpad pinch-to-zoom on macOS while keeping Cmd+/- zoom.
 /// WKWebView handles magnification at the native level — JS `preventDefault()`
 /// cannot block it.
@@ -262,10 +379,10 @@ fn disable_pinch_zoom(window: &tauri::WebviewWindow) {
     });
 }
 
-#[cfg(target_os = "macos")]
 fn show_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
+        let _ = window.unminimize();
         let _ = window.set_focus();
     }
 }

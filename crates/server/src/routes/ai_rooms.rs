@@ -29,8 +29,12 @@ use crate::{
 
 const ROOM_DIR: &str = ".ai-room";
 const LIBRARY_DIR: &str = "library";
+const LEGACY_DECISIONS_FILE: &str = "library/legacy-decisions.md";
 const LIBRARY_BASELINE_FILE: &str = ".library-baseline.json";
-const INSTRUCTION_VERSION: i64 = 5;
+const SESSION_OVERRIDES_FILE: &str = "session-overrides.json";
+const DECISIONS_MANAGED_COMMENT: &str =
+    "<!-- Task AI Platform가 안정된 AI 작업 기록에서 확정된 결정을 자동 정리합니다. -->";
+const INSTRUCTION_VERSION: i64 = 7;
 const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
 const CLEAR_SEND_ENV: &str = "SendEnv=-*";
 const START_MARKER: &str = "<!-- task-ai-room:start -->";
@@ -38,13 +42,15 @@ const END_MARKER: &str = "<!-- task-ai-room:end -->";
 const SESSION_COMPLETE_MARKER: &str = "<!-- task-ai-room:complete -->";
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(15);
 const TASK_SUMMARY_INTERVAL: Duration = Duration::from_secs(45);
-const SESSION_STABLE_AFTER: Duration = Duration::from_secs(90);
+const SESSION_STABLE_AFTER: Duration = Duration::from_secs(120);
 const TASK_SUMMARY_STATE_FILE: &str = "task-summary-state.json";
-const TASK_DASHBOARD_VERSION: u8 = 5;
+const TASK_DASHBOARD_VERSION: u8 = 7;
+const DECISION_DASHBOARD_VERSION: u8 = 4;
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_TASK_SUMMARY_MODEL: &str = "qwen3.5:4b";
 const MAX_SESSION_PROMPT_BYTES: usize = 96 * 1024;
 const MAX_TASKS_PROMPT_BYTES: usize = 32 * 1024;
+const MAX_DECISIONS_PROMPT_BYTES: usize = 48 * 1024;
 static SYNC_LOCK: Mutex<()> = Mutex::const_new(());
 static TASK_SUMMARY_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -71,6 +77,7 @@ pub struct AiRoomSnapshot {
     pub decisions: String,
     pub tasks: String,
     pub sessions: Vec<AiRoomRecord>,
+    pub session_overrides: BTreeMap<String, String>,
     pub library: Vec<AiRoomRecord>,
     pub conflicts: Vec<String>,
     pub local: AiRoomEndpointState,
@@ -80,6 +87,12 @@ pub struct AiRoomSnapshot {
 #[derive(Debug, Deserialize, TS)]
 pub struct UpdateAiRoomDocumentRequest {
     pub content: String,
+}
+
+#[derive(Debug, Deserialize, TS)]
+pub struct UpdateAiRoomSessionStatusRequest {
+    pub filename: String,
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -102,6 +115,8 @@ struct EndpointFiles {
 struct TaskSummaryState {
     dashboard_hash: Option<String>,
     tasks_hash: Option<String>,
+    decisions_source_hash: Option<String>,
+    decisions_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +130,21 @@ struct TaskDashboardItem {
     title: String,
     next: String,
     blocked: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DecisionDashboard {
+    items: Vec<DecisionDashboardItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DecisionDashboardItem {
+    date: String,
+    title: String,
+    decision: String,
+    rationale: String,
+    status: String,
+    evidence: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,9 +250,55 @@ pub async fn update_document(
     if payload.content.len() > MAX_DOCUMENT_BYTES {
         return Err(ApiError::PayloadTooLarge);
     }
+    if kind != "context" {
+        return Err(ApiError::BadRequest(
+            "Tasks and decisions are managed automatically from session records".into(),
+        ));
+    }
     let relative = document_path(&kind)?;
     let room = find_room(&deployment, room_id).await?;
     write_local_file(&room, relative, &payload.content).await?;
+    AiRoom::touch(&deployment.db().pool, room.id).await?;
+    let room = find_room(&deployment, room_id).await?;
+    Ok(ResponseJson(ApiResponse::success(
+        build_snapshot(room).await,
+    )))
+}
+
+pub async fn update_session_status(
+    State(deployment): State<DeploymentImpl>,
+    Path(room_id): Path<Uuid>,
+    Json(payload): Json<UpdateAiRoomSessionStatusRequest>,
+) -> Result<ResponseJson<ApiResponse<AiRoomSnapshot>>, ApiError> {
+    if !payload.filename.starts_with("sessions/")
+        || !payload.filename.ends_with(".md")
+        || payload.filename.contains(['\\', '\0', '\r', '\n'])
+        || payload.filename["sessions/".len()..].contains('/')
+    {
+        return Err(ApiError::BadRequest("Invalid session filename".into()));
+    }
+    let status = payload.status.map(|value| value.trim().to_lowercase());
+    if status.as_deref().is_some_and(|value| value != "stopped") {
+        return Err(ApiError::BadRequest(
+            "Session status must be stopped or null".into(),
+        ));
+    }
+
+    let room = find_room(&deployment, room_id).await?;
+    let room_dir = PathBuf::from(&room.local_root).join(ROOM_DIR);
+    if fs::metadata(room_dir.join(&payload.filename))
+        .await
+        .is_err()
+    {
+        return Err(ApiError::BadRequest("Session record not found".into()));
+    }
+    let mut overrides = read_session_overrides(&room_dir).await;
+    if let Some(status) = status {
+        overrides.insert(payload.filename, status);
+    } else {
+        overrides.remove(&payload.filename);
+    }
+    write_session_overrides(&room_dir, &overrides).await?;
     AiRoom::touch(&deployment.db().pool, room.id).await?;
     let room = find_room(&deployment, room_id).await?;
     Ok(ResponseJson(ApiResponse::success(
@@ -336,49 +412,21 @@ async fn sync_room_internal(
             ));
         }
 
-        for (filename, content) in remote
-            .files
-            .iter()
-            .filter(|(name, _)| name.starts_with("sessions/"))
-        {
-            match local.files.get(filename) {
-                None => {
-                    write_local_file(&room, filename, content).await?;
-                    copied_to_local.push(filename.clone());
-                }
-                Some(local_content) if local_content != content => conflicts.push(filename.clone()),
-                _ => {}
-            }
-        }
+        let (checkpoint_copies, checkpoint_conflicts) =
+            sync_remote_checkpoints(&room, &mut local, &remote).await?;
+        copied_to_local.extend(checkpoint_copies);
+        conflicts.extend(checkpoint_conflicts);
 
-        for document in ["context.md", "decisions.md"] {
-            if let (Some(left), Some(right)) =
-                (local.files.get(document), remote.files.get(document))
-                && left != right
-            {
-                conflicts.push(document.to_string());
-            }
-        }
-
-        if let (Some(local_tasks), Some(remote_tasks)) =
-            (local.files.get("tasks.md"), remote.files.get("tasks.md"))
-            && local_tasks != remote_tasks
-        {
-            if is_append_only_update(local_tasks, remote_tasks) {
-                write_local_file(&room, "tasks.md", remote_tasks).await?;
-                copied_to_local.push("tasks.md".into());
-            } else {
-                conflicts.push("tasks.md".into());
-            }
-        }
-
-        let (library_copies, library_conflicts) =
-            merge_remote_library_documents(&room, &mut local.files, &remote.files).await?;
-        copied_to_local.extend(library_copies);
-        conflicts.extend(library_conflicts);
-
-        if conflicts.is_empty() {
+        if all_remote_sessions_complete(&remote.files) && conflicts.is_empty() {
             removed_from_remote = clean_remote_room(alias, root, &remote.files).await?;
+        } else if !all_remote_sessions_complete(&remote.files) {
+            upgrade_remote_instructions(
+                &room,
+                alias,
+                root,
+                remote.files.get("ROOM.md").map(String::as_str),
+            )
+            .await?;
         }
     }
 
@@ -393,6 +441,114 @@ async fn sync_room_internal(
         conflicts,
         snapshot,
     })
+}
+
+async fn sync_remote_checkpoints(
+    room: &AiRoom,
+    local: &mut EndpointFiles,
+    remote: &EndpointFiles,
+) -> Result<(Vec<String>, Vec<String>), ApiError> {
+    let mut copied = Vec::new();
+    let mut conflicts = Vec::new();
+
+    for (filename, content) in remote
+        .files
+        .iter()
+        .filter(|(name, _)| name.starts_with("sessions/"))
+    {
+        match local.files.get(filename) {
+            None => {
+                write_local_file(room, filename, content).await?;
+                local.files.insert(filename.clone(), content.clone());
+                copied.push(filename.clone());
+            }
+            Some(local_content) if local_content == content => {}
+            Some(local_content) if content.starts_with(local_content) => {
+                write_local_file(room, filename, content).await?;
+                local.files.insert(filename.clone(), content.clone());
+                copied.push(filename.clone());
+            }
+            Some(local_content) if local_content.starts_with(content) => {}
+            Some(local_content)
+                if session_status(local_content)
+                    .is_some_and(|status| status_is_stopped(&status)) => {}
+            Some(_) => conflicts.push(filename.clone()),
+        }
+    }
+
+    if let (Some(local_context), Some(remote_context)) = (
+        local.files.get("context.md"),
+        remote.files.get("context.md"),
+    ) && local_context != remote_context
+    {
+        if remote_context.starts_with(local_context) {
+            write_local_file(room, "context.md", remote_context).await?;
+            local
+                .files
+                .insert("context.md".into(), remote_context.clone());
+            copied.push("context.md".into());
+        } else {
+            conflicts.push("context.md".into());
+        }
+    }
+
+    if let (Some(local_decisions), Some(remote_decisions)) = (
+        local.files.get("decisions.md"),
+        remote.files.get("decisions.md"),
+    ) && !local_decisions.contains(DECISIONS_MANAGED_COMMENT)
+        && local_decisions != remote_decisions
+    {
+        if remote_decisions.starts_with(local_decisions)
+            || local_decisions.trim()
+                == "# Decisions\n\nAppend dated architectural and product decisions here."
+        {
+            write_local_file(room, "decisions.md", remote_decisions).await?;
+            local
+                .files
+                .insert("decisions.md".into(), remote_decisions.clone());
+            copied.push("decisions.md".into());
+        } else {
+            conflicts.push("decisions.md".into());
+        }
+    }
+
+    let (library_copies, library_conflicts) =
+        merge_remote_library_documents(room, &mut local.files, &remote.files).await?;
+    copied.extend(library_copies);
+    conflicts.extend(library_conflicts);
+    Ok((copied, conflicts))
+}
+
+async fn upgrade_remote_instructions(
+    room: &AiRoom,
+    alias: &str,
+    root: &str,
+    current_instruction: Option<&str>,
+) -> Result<(), ApiError> {
+    let instruction = room_instruction(room);
+    if current_instruction == Some(instruction.as_str()) {
+        return Ok(());
+    }
+    let manifest = serde_json::json!({
+        "room_id": room.id,
+        "name": room.name,
+        "instruction_version": INSTRUCTION_VERSION,
+    });
+    let block = managed_agent_block(room);
+    let mut files = vec![
+        (
+            "room.json".into(),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        ),
+        ("ROOM.md".into(), instruction),
+    ];
+    for filename in ["AGENTS.md", "CLAUDE.md"] {
+        let existing = read_remote_root_file(alias, root, filename)
+            .await
+            .unwrap_or_default();
+        files.push((filename.into(), upsert_managed_block(&existing, &block)));
+    }
+    write_remote_files(alias, root, &files).await
 }
 
 pub fn spawn_auto_sync(deployment: DeploymentImpl) {
@@ -446,29 +602,59 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
                 .filter(|room| room.ssh_alias.is_some() && room.remote_root.is_some())
             {
                 let remote = read_remote_files(&room).await;
-                let sessions_are_complete =
-                    remote.available && all_remote_sessions_complete(&remote.files);
-                if !sessions_are_complete {
+                if !remote.available {
                     continue;
                 }
 
                 let _guard = SYNC_LOCK.lock().await;
-                match sync_room_internal(&deployment, room).await {
-                    Ok(result) if result.conflicts.is_empty() => {
-                        tracing::info!(
-                            copied = result.copied_to_local.len(),
-                            removed = result.removed_from_remote.len(),
-                            "AI Room automatically synchronized and cleaned the server"
-                        );
+                if all_remote_sessions_complete(&remote.files) {
+                    match sync_room_internal(&deployment, room).await {
+                        Ok(result) if result.conflicts.is_empty() => {
+                            tracing::info!(
+                                copied = result.copied_to_local.len(),
+                                removed = result.removed_from_remote.len(),
+                                "AI Room automatically synchronized and cleaned the server"
+                            );
+                        }
+                        Ok(result) => {
+                            tracing::warn!(
+                                conflicts = result.conflicts.len(),
+                                "AI Room automatic sync preserved conflicting server records"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!("AI Room automatic sync failed: {error}");
+                        }
                     }
-                    Ok(result) => {
-                        tracing::warn!(
-                            conflicts = result.conflicts.len(),
-                            "AI Room automatic sync preserved conflicting server records"
-                        );
+                    continue;
+                }
+
+                let mut local = read_local_files(&room).await;
+                match sync_remote_checkpoints(&room, &mut local, &remote).await {
+                    Ok((copied, conflicts)) => {
+                        if let (Some(alias), Some(root)) = (&room.ssh_alias, &room.remote_root)
+                            && let Err(error) = upgrade_remote_instructions(
+                                &room,
+                                alias,
+                                root,
+                                remote.files.get("ROOM.md").map(String::as_str),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "AI Room could not upgrade active server instructions: {error}"
+                            );
+                        }
+                        if !copied.is_empty() || !conflicts.is_empty() {
+                            tracing::info!(
+                                copied = copied.len(),
+                                conflicts = conflicts.len(),
+                                "AI Room mirrored active server checkpoints without cleanup"
+                            );
+                        }
                     }
                     Err(error) => {
-                        tracing::warn!("AI Room automatic sync failed: {error}");
+                        tracing::warn!("AI Room active checkpoint sync failed: {error}");
                     }
                 }
             }
@@ -514,8 +700,8 @@ fn normalized_local_path(path: &FsPath) -> String {
 }
 
 fn room_instruction(room: &AiRoom) -> String {
-    format!(
-        "# AI Room: {name}\n\nRoom ID: `{id}`\nInstruction version: {version}\n\n## Required session workflow\n\n1. Before doing any work, read `.ai-room/context.md`, `.ai-room/decisions.md`, `.ai-room/tasks.md`, every relevant file in `.ai-room/library/`, and the newest files in `.ai-room/sessions/`.\n2. Create one new session file named `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<short-id>.md`. Never reuse another session's filename.\n3. Record the goal, assumptions, important commands, files changed, verification results, decisions, blockers, and concrete next steps. Update it during the session, not only at the end. A chat may remain open for months: after every meaningful work unit, update the session file with a clear checkpoint so the local app can refresh the task dashboard after the file becomes idle. If the user pauses, stops, or cancels work while you can still write, immediately record the status as Stopped or Cancelled so it is not reported as active or completed.\n4. When the user asks you to remember a reusable method, rule, convention, checklist, prompt, or operating procedure, create or update one focused Markdown file in `.ai-room/library/`. Use a descriptive filename ending in `.md`, keep one topic per file, and make it understandable without chat history. Do not use the library for transient session notes.\n5. Do not edit `tasks.md`. Task AI Platform reads all stable session records together and locally rebuilds a deduplicated current-work and completed-work dashboard. Make the result, current state, next action, and blockers explicit in the session file so later records can supersede older ones accurately.\n6. Update `context.md` only for durable project facts. Append architectural decisions to `decisions.md`; do not rewrite history.\n7. Never store secrets, tokens, private keys, raw credentials, personal data, or generated binaries in room files.\n8. Before ending the entire work record, make the session file sufficient for another Claude or Codex session to continue without relying on chat history. After all other writes are finished, add `{complete_marker}` as the final line. The completion marker is for safe server synchronization and cleanup; task-dashboard updates do not wait for the chat to end.\n\n## Server privacy\n\nWhen this room is prepared on its SSH server, all `.ai-room` files there are temporary. The Task AI Platform safely merges library documents and copies completed session files to the local root, then removes the server-side room files after a conflict-free sync. The local task summarizer uses only the local Ollama service; session contents are not sent to a cloud model. Do not assume earlier session files remain on the server.\n\n## Room endpoints\n\n- Local root: `{local}`\n- Remote root: `{remote}`\n\nThe Task AI Platform manages and synchronizes these records. Claude and Codex perform the project work directly in the selected root.\n",
+    let instruction = format!(
+        "# AI Room: {name}\n\nRoom ID: `{id}`\nInstruction version: {version}\n\n## Required session workflow\n\n1. Before doing any work, read `.ai-room/context.md`, `.ai-room/decisions.md`, `.ai-room/tasks.md`, every relevant file in `.ai-room/library/`, every additional Markdown instruction directly under `.ai-room/`, and the newest files in `.ai-room/sessions/`.\n2. Create one new session file named `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<short-id>.md`. Never reuse another session's filename.\n3. Record the goal, assumptions, important commands, files changed, verification results, candidate decisions, blockers, and concrete next steps. Write the first checkpoint immediately. Update it after every meaningful work unit and never allow more than 10 minutes of active work without a checkpoint. A chat may remain open for months; checkpoints are work-state records, not chat endings. If the user pauses, stops, or cancels work while you can still write, immediately record the status as Stopped or Cancelled.\n4. When the user asks you to remember a reusable method, rule, convention, checklist, prompt, or operating procedure, create or update one focused Markdown file in `.ai-room/library/`. Use a descriptive filename ending in `.md`, keep one topic per file, and make it understandable without chat history. Do not use the library for transient session notes.\n5. Do not edit `tasks.md` or `decisions.md`. Task AI Platform reads stable session checkpoints together and locally rebuilds both documents. State results, approval status, next actions, blockers, and whether a candidate decision was actually approved explicitly in the session file.\n6. Treat `context.md` as owner-authored project context. Read it but do not edit it unless the user explicitly asks you to change that document.\n7. Never store secrets, tokens, private keys, raw credentials, personal data, or generated binaries in room files.\n8. Before ending the entire work record, make the session file sufficient for another Claude or Codex session to continue without relying on chat history. After all other writes are finished, add `{complete_marker}` as the final line. The completion marker is only for safe server cleanup; local task and decision updates use stable intermediate checkpoints after two quiet minutes.\n\n## Server privacy\n\nWhile work is active, Task AI Platform copies changing server session checkpoints to local storage without deleting the server files. Once every remote session is complete and the merge is conflict-free, it removes the temporary server room. Task and decision summarization uses only the local Ollama service; session contents are not sent to a cloud model.\n\n## Room endpoints\n\n- Local root: `{local}`\n- Remote root: `{remote}`\n\nThe Task AI Platform manages and synchronizes these records. Claude and Codex perform the project work directly in the selected root.\n",
         name = room.name,
         id = room.id,
         version = INSTRUCTION_VERSION,
@@ -527,6 +713,9 @@ fn room_instruction(room: &AiRoom) -> String {
             .zip(room.remote_root.as_ref())
             .map(|(alias, root)| format!("{alias}:{root}"))
             .unwrap_or_else(|| "not configured".into()),
+    );
+    format!(
+        "{instruction}\n## Record language\n\n- Session checkpoint files may use whichever language lets the active AI preserve technical meaning and handoff context most accurately; they do not need to be Korean.\n- `decisions.md` is shared by the owner and every AI. Task AI Platform renders its explanatory text in Korean and translates session content when necessary. Keep code identifiers, file paths, and product names unchanged when translation would damage their meaning.\n"
     )
 }
 
@@ -565,11 +754,16 @@ fn initial_files(room: &AiRoom) -> Vec<(String, String)> {
         ("ROOM.md".into(), room_instruction(room)),
         (
             "context.md".into(),
-            format!("# Context\n\nDurable project context for {}.\n", room.name),
+            format!(
+                "# Context\n\n프로젝트 소유자가 직접 관리하는 {}의 지속적인 맥락입니다.\n",
+                room.name
+            ),
         ),
         (
             "decisions.md".into(),
-            "# Decisions\n\nAppend dated architectural and product decisions here.\n".into(),
+            format!(
+                "# Decisions\n\n{DECISIONS_MANAGED_COMMENT}\n\n## 현재 결정\n\n- 아직 기록된 확정 결정이 없습니다.\n\n## 변경·폐기된 결정\n\n- 아직 기록된 변경·폐기 결정이 없습니다.\n"
+            ),
         ),
         (
             "tasks.md".into(),
@@ -577,10 +771,6 @@ fn initial_files(room: &AiRoom) -> Vec<(String, String)> {
                 .into(),
         ),
     ]
-}
-
-fn is_append_only_update(local: &str, remote: &str) -> bool {
-    remote.len() > local.len() && remote.starts_with(local)
 }
 
 fn all_remote_sessions_complete(files: &BTreeMap<String, String>) -> bool {
@@ -722,10 +912,26 @@ async fn summarize_pending_sessions(deployment: &DeploymentImpl) -> Result<(), S
 async fn summarize_next_session(room: &AiRoom) -> Result<(), String> {
     let room_dir = PathBuf::from(&room.local_root).join(ROOM_DIR);
     let tasks_path = room_dir.join("tasks.md");
+    let decisions_path = room_dir.join("decisions.md");
     let initial_tasks = fs::read_to_string(&tasks_path)
         .await
         .map_err(|error| format!("{} has no readable task list: {error}", room.name))?;
+    let initial_decisions = fs::read_to_string(&decisions_path)
+        .await
+        .map_err(|error| format!("{} has no readable decision log: {error}", room.name))?;
+    let legacy_decisions = fs::read_to_string(room_dir.join(LEGACY_DECISIONS_FILE))
+        .await
+        .unwrap_or_default();
+    let decision_sources = if legacy_decisions.is_empty() {
+        initial_decisions.clone()
+    } else {
+        format!(
+            "===== {} =====\n{}\n\n===== decisions.md =====\n{}",
+            LEGACY_DECISIONS_FILE, legacy_decisions, initial_decisions
+        )
+    };
     let mut state = read_task_summary_state(&room_dir).await;
+    let overrides = read_session_overrides(&room_dir).await;
     let mut sessions = Vec::new();
     let mut entries = match fs::read_dir(room_dir.join("sessions")).await {
         Ok(entries) => entries,
@@ -756,29 +962,59 @@ async fn summarize_next_session(room: &AiRoom) -> Result<(), String> {
         return Ok(());
     }
 
-    let dashboard_hash = session_collection_hash(&sessions);
+    let overrides_json = serde_json::to_string(&overrides).unwrap_or_default();
+    let dashboard_hash = format!(
+        "{}:{}",
+        session_collection_hash(&sessions),
+        content_hash(&overrides_json)
+    );
+    let decisions_source_hash =
+        versioned_session_collection_hash(DECISION_DASHBOARD_VERSION, &sessions, &legacy_decisions);
     let initial_tasks_hash = content_hash(&initial_tasks);
-    if state.dashboard_hash.as_ref() == Some(&dashboard_hash)
-        && state.tasks_hash.as_ref() == Some(&initial_tasks_hash)
-    {
+    let initial_decisions_hash = content_hash(&initial_decisions);
+    let tasks_current = state.dashboard_hash.as_ref() == Some(&dashboard_hash)
+        && state.tasks_hash.as_ref() == Some(&initial_tasks_hash);
+    let decisions_current = state.decisions_source_hash.as_ref() == Some(&decisions_source_hash)
+        && state.decisions_hash.as_ref() == Some(&initial_decisions_hash);
+    if tasks_current && decisions_current {
         return Ok(());
     }
 
-    let dashboard = request_local_task_dashboard(&sessions, &initial_tasks).await?;
-    let dashboard = remove_stopped_sessions(dashboard, &sessions);
-    let content = render_task_dashboard(dashboard)?;
-    let tasks_hash = content_hash(&content);
-    fs::write(&tasks_path, content)
-        .await
-        .map_err(|error| format!("Unable to update {} tasks: {error}", room.name))?;
+    if !tasks_current {
+        let dashboard = request_local_task_dashboard(&sessions, &initial_tasks).await?;
+        let dashboard = remove_stopped_sessions(dashboard, &sessions, &overrides);
+        let dashboard = ensure_latest_next_action(dashboard, &sessions, &overrides);
+        let content = render_task_dashboard(dashboard)?;
+        let tasks_hash = content_hash(&content);
+        fs::write(&tasks_path, content)
+            .await
+            .map_err(|error| format!("Unable to update {} tasks: {error}", room.name))?;
+        state.dashboard_hash = Some(dashboard_hash);
+        state.tasks_hash = Some(tasks_hash);
+        write_task_summary_state(&room_dir, &state).await?;
+    }
 
-    state.dashboard_hash = Some(dashboard_hash);
-    state.tasks_hash = Some(tasks_hash);
-    write_task_summary_state(&room_dir, &state).await?;
+    if !decisions_current {
+        let dashboard = request_local_decision_dashboard(&sessions, &decision_sources).await?;
+        let dashboard = augment_explicit_decisions(dashboard, &sessions);
+        let content = render_decision_dashboard(
+            dashboard,
+            &sessions,
+            (!legacy_decisions.is_empty())
+                .then_some((LEGACY_DECISIONS_FILE, legacy_decisions.as_str())),
+        )?;
+        let decisions_hash = content_hash(&content);
+        fs::write(&decisions_path, content)
+            .await
+            .map_err(|error| format!("Unable to update {} decisions: {error}", room.name))?;
+        state.decisions_source_hash = Some(decisions_source_hash);
+        state.decisions_hash = Some(decisions_hash);
+        write_task_summary_state(&room_dir, &state).await?;
+    }
     tracing::info!(
         room_id = %room.id,
         sessions = sessions.len(),
-        "AI Room rebuilt the consolidated task dashboard locally"
+        "AI Room rebuilt local task and decision dashboards"
     );
     Ok(())
 }
@@ -800,13 +1036,40 @@ async fn write_task_summary_state(
         .map_err(|error| format!("Unable to save local task summary state: {error}"))
 }
 
+async fn read_session_overrides(room_dir: &FsPath) -> BTreeMap<String, String> {
+    let Ok(content) = fs::read_to_string(room_dir.join(SESSION_OVERRIDES_FILE)).await else {
+        return BTreeMap::new();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+async fn write_session_overrides(
+    room_dir: &FsPath,
+    overrides: &BTreeMap<String, String>,
+) -> Result<(), ApiError> {
+    let content = serde_json::to_string_pretty(overrides)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    fs::write(room_dir.join(SESSION_OVERRIDES_FILE), content).await?;
+    Ok(())
+}
+
 fn content_hash(content: &str) -> String {
     format!("{:x}", Sha256::digest(content.as_bytes()))
 }
 
 fn session_collection_hash(sessions: &[(String, String)]) -> String {
+    versioned_session_collection_hash(TASK_DASHBOARD_VERSION, sessions, "")
+}
+
+fn versioned_session_collection_hash(
+    version: u8,
+    sessions: &[(String, String)],
+    seed: &str,
+) -> String {
     let mut hasher = Sha256::new();
-    hasher.update([TASK_DASHBOARD_VERSION]);
+    hasher.update([version]);
+    hasher.update(seed.as_bytes());
+    hasher.update([0xfe]);
     for (filename, content) in sessions {
         hasher.update(filename.as_bytes());
         hasher.update([0]);
@@ -910,6 +1173,111 @@ async fn request_local_task_dashboard(
         .map_err(|error| format!("Ollama returned invalid task dashboard JSON: {error}"))
 }
 
+async fn request_local_decision_dashboard(
+    sessions: &[(String, String)],
+    decisions: &str,
+) -> Result<DecisionDashboard, String> {
+    let base_url = env::var("TASK_AI_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.into());
+    let model =
+        env::var("TASK_AI_SUMMARY_MODEL").unwrap_or_else(|_| DEFAULT_TASK_SUMMARY_MODEL.into());
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "maxItems": 30,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "date": { "type": "string" },
+                        "title": { "type": "string" },
+                        "decision": { "type": "string" },
+                        "rationale": { "type": "string" },
+                        "status": {
+                            "type": "string",
+                            "enum": ["current", "superseded"]
+                        },
+                        "evidence": {
+                            "type": "array",
+                            "maxItems": 4,
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "required": [
+                        "date",
+                        "title",
+                        "decision",
+                        "rationale",
+                        "status",
+                        "evidence"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["items"],
+        "additionalProperties": false
+    });
+    let mut records = String::new();
+    for (filename, content) in sessions {
+        records.push_str("\n\n===== ");
+        records.push_str(filename);
+        records.push_str(" =====\n");
+        records.push_str(&bounded_text(content, 12 * 1024));
+    }
+    let prompt = format!(
+        "프로젝트의 결정 기록을 시간순 AI 작업 기록 전체로부터 다시 작성하라. 반드시 요청된 JSON 스키마만 반환하라.\n\
+         규칙:\n\
+         - 사용자가 승인했거나 실제 구현·검증 결과로 확정된 지속적인 기술·제품·운영 결정만 포함한다.\n\
+         - 제안, 선택 대기, 미승인 계획, 단순 작업 결과, 다음 할 일은 결정으로 만들지 않는다.\n\
+         - 뒤의 기록이 앞의 기록보다 최신이다. 같은 주제는 병합하고 변경된 옛 결정은 superseded로 표시한다.\n\
+         - 중단된 세션에서도 이미 명시적으로 확정된 결정만 보존한다. 중단 사실 자체는 결정이 아니다.\n\
+         - 기존 결정 기록의 확정 내용은 세션과 충돌하지 않는 한 보존하되 중복은 제거한다.\n\
+         - date는 YYYY-MM-DD로 작성한다. title, decision, rationale은 원문 언어와 관계없이 반드시 자연스러운 한국어로 번역·작성한다.\n\
+         - 코드 식별자, 파일 경로, 제품명처럼 번역하면 의미가 훼손되는 고유명사만 원문 표기를 허용한다. 설명 문장 전체를 영어로 남기지 않는다.\n\
+         - evidence에는 반드시 아래에 제공된 sessions/... 파일명 또는 library/legacy-decisions.md를 넣는다. 근거가 없는 항목은 만들지 않는다.\n\
+         - 필드 안에 마크다운, 줄바꿈, 파이프 문자를 넣지 않는다.\n\n\
+         기존 결정 기록:\n{}\n\n\
+         시간순 작업 기록:\n{}",
+        bounded_text(decisions, MAX_DECISIONS_PROMPT_BYTES),
+        bounded_text(&records, MAX_SESSION_PROMPT_BYTES)
+    );
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .post(format!("{}/api/chat", base_url.trim_end_matches('/')))
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": prompt }],
+            "format": schema,
+            "stream": false,
+            "think": false,
+            "keep_alive": "5m",
+            "options": { "temperature": 0 }
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("Local Ollama is unavailable: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("Unable to read Ollama response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Ollama rejected decision summarization ({status}): {}",
+            bounded_text(&body, 300)
+        ));
+    }
+    let response: OllamaChatResponse =
+        serde_json::from_str(&body).map_err(|error| format!("Invalid Ollama response: {error}"))?;
+    serde_json::from_str(response.message.content.trim())
+        .map_err(|error| format!("Ollama returned invalid decision dashboard JSON: {error}"))
+}
+
 fn bounded_text(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_string();
@@ -952,6 +1320,12 @@ fn is_none_value(value: &str) -> bool {
     )
 }
 
+fn contains_hangul(value: &str) -> bool {
+    value
+        .chars()
+        .any(|character| matches!(character, '\u{AC00}'..='\u{D7A3}'))
+}
+
 fn task_title_key(value: &str) -> String {
     clean_summary_field(value, 180, "").to_lowercase()
 }
@@ -980,6 +1354,12 @@ fn session_status(content: &str) -> Option<String> {
     None
 }
 
+fn status_is_stopped(status: &str) -> bool {
+    ["stopped", "cancelled", "canceled", "중단", "취소"]
+        .iter()
+        .any(|marker| status.contains(marker))
+}
+
 fn same_task_title(left: &str, right: &str) -> bool {
     let left = task_title_key(left);
     let right = task_title_key(right);
@@ -991,23 +1371,97 @@ fn same_task_title(left: &str, right: &str) -> bool {
 fn remove_stopped_sessions(
     mut dashboard: TaskDashboard,
     sessions: &[(String, String)],
+    overrides: &BTreeMap<String, String>,
 ) -> TaskDashboard {
-    let stopped_titles = sessions
+    let mut stopped_titles = sessions
         .iter()
         .filter_map(|(_, content)| {
             let status = session_status(content)?;
-            ["stopped", "cancelled", "canceled", "중단", "취소"]
-                .iter()
-                .any(|marker| status.contains(marker))
+            status_is_stopped(&status)
                 .then(|| session_title(content))
                 .flatten()
         })
         .collect::<Vec<_>>();
+    stopped_titles.extend(sessions.iter().filter_map(|(filename, content)| {
+        overrides
+            .get(filename)
+            .is_some_and(|status| status == "stopped")
+            .then(|| session_title(content))
+            .flatten()
+    }));
     dashboard.items.retain(|item| {
         !stopped_titles
             .iter()
             .any(|title| same_task_title(&item.title, title))
     });
+    dashboard
+}
+
+fn extract_next_action(content: &str) -> Option<String> {
+    for line in content.lines().rev() {
+        let candidate = line
+            .trim()
+            .trim_start_matches(['-', '*'])
+            .trim()
+            .trim_start_matches("**")
+            .trim_end_matches("**");
+        for marker in ["후속=", "후속:", "Next:", "다음:"] {
+            if let Some((_, action)) = candidate.split_once(marker) {
+                let action = clean_summary_field(action, 180, "");
+                if !action.is_empty() && !is_none_value(&action) {
+                    return Some(action);
+                }
+            }
+        }
+    }
+
+    let lines = content.lines().collect::<Vec<_>>();
+    for (index, line) in lines.iter().enumerate().rev() {
+        if line.trim().eq_ignore_ascii_case("## Next") {
+            return lines[index + 1..].iter().find_map(|line| {
+                let action =
+                    clean_summary_field(line.trim().trim_start_matches(['-', '*']).trim(), 180, "");
+                (!action.is_empty() && !is_none_value(&action)).then_some(action)
+            });
+        }
+    }
+    None
+}
+
+fn ensure_latest_next_action(
+    mut dashboard: TaskDashboard,
+    sessions: &[(String, String)],
+    overrides: &BTreeMap<String, String>,
+) -> TaskDashboard {
+    if dashboard
+        .items
+        .iter()
+        .any(|item| matches!(item.status.to_lowercase().as_str(), "active" | "blocked"))
+    {
+        return dashboard;
+    }
+    let Some((filename, content)) = sessions.last() else {
+        return dashboard;
+    };
+    if overrides
+        .get(filename)
+        .is_some_and(|status| status == "stopped")
+        || session_status(content).is_some_and(|status| status_is_stopped(&status))
+    {
+        return dashboard;
+    }
+    let Some(action) = extract_next_action(content) else {
+        return dashboard;
+    };
+    dashboard.items.insert(
+        0,
+        TaskDashboardItem {
+            status: "active".into(),
+            title: action,
+            next: "최신 체크포인트에 기록된 후속 작업을 수행한다".into(),
+            blocked: "none".into(),
+        },
+    );
     dashboard
 }
 
@@ -1076,10 +1530,302 @@ fn render_task_dashboard(dashboard: TaskDashboard) -> Result<String, String> {
     Ok(output)
 }
 
+fn valid_decision_date(value: &str) -> bool {
+    value.len() == 10
+        && value.as_bytes()[4] == b'-'
+        && value.as_bytes()[7] == b'-'
+        && value
+            .chars()
+            .enumerate()
+            .all(|(index, value)| matches!(index, 4 | 7) || value.is_ascii_digit())
+}
+
+fn augment_explicit_decisions(
+    mut dashboard: DecisionDashboard,
+    sessions: &[(String, String)],
+) -> DecisionDashboard {
+    let mut seen = dashboard
+        .items
+        .iter()
+        .map(|item| clean_summary_field(&item.decision, 360, "").to_lowercase())
+        .collect::<BTreeSet<_>>();
+    let mut added = 0;
+
+    for (filename, content) in sessions.iter().rev() {
+        let title = session_title(content).unwrap_or_else(|| "세션 결정".into());
+        for line in content.lines() {
+            let normalized = line.trim().trim_start_matches(['-', '*']).trim();
+            let lowered = normalized.to_lowercase();
+            if ["미승인", "제안", "승인 시", "candidate"]
+                .iter()
+                .any(|marker| lowered.contains(marker))
+            {
+                continue;
+            }
+            let extracted = normalized
+                .split_once("결정:")
+                .map(|(_, decision)| decision)
+                .or_else(|| {
+                    normalized.contains("→ 폐기").then(|| {
+                        normalized
+                            .split_once("판정:")
+                            .map_or(normalized, |(_, v)| v)
+                    })
+                });
+            let Some(extracted) = extracted else {
+                continue;
+            };
+            let decision = clean_summary_field(extracted.trim_matches('*'), 360, "");
+            let key = decision.to_lowercase();
+            if decision.chars().count() < 6 || !contains_hangul(&decision) || !seen.insert(key) {
+                continue;
+            }
+            dashboard.items.push(DecisionDashboardItem {
+                date: session_date(filename).unwrap_or_else(|| "날짜 미상".into()),
+                title: format!("{} — 명시적 결정", clean_summary_field(&title, 110, "")),
+                decision,
+                rationale: "세션 체크포인트에서 결정으로 명시됨".into(),
+                status: "current".into(),
+                evidence: vec![filename.clone()],
+            });
+            added += 1;
+            if added >= 30 {
+                return dashboard;
+            }
+        }
+    }
+    dashboard
+}
+
+fn decision_is_durable(item: &DecisionDashboardItem) -> bool {
+    let combined = format!("{} {} {}", item.title, item.decision, item.rationale).to_lowercase();
+    [
+        "채택",
+        "사용한다",
+        "사용하지",
+        "해야",
+        "않는다",
+        "기본",
+        "유지",
+        "전환",
+        "금지",
+        "규칙",
+        "구조",
+        "기준",
+        "방식",
+        "정의",
+        "정책",
+        "폐기",
+        "접음",
+        "접는다",
+        "adopt",
+        "must",
+        "default",
+        "do not",
+        "policy",
+        "architecture",
+    ]
+    .iter()
+    .any(|marker| combined.contains(marker))
+}
+
+fn session_date(filename: &str) -> Option<String> {
+    let stem = filename.strip_prefix("sessions/")?;
+    let raw = stem.get(..8)?;
+    raw.chars()
+        .all(|value| value.is_ascii_digit())
+        .then(|| format!("{}-{}-{}", &raw[0..4], &raw[4..6], &raw[6..8]))
+}
+
+fn infer_decision_evidence(
+    title: &str,
+    decision: &str,
+    sessions: &[(String, String)],
+) -> Option<String> {
+    let query = format!("{} {}", title.to_lowercase(), decision.to_lowercase());
+    let tokens = query
+        .split(|value: char| !value.is_alphanumeric())
+        .filter(|token| token.chars().count() >= 4)
+        .filter(|token| {
+            !matches!(
+                *token,
+                "결정" | "결과" | "실행" | "완료" | "사용자" | "프로젝트"
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut best = None;
+    let mut best_score = 0;
+    for (filename, content) in sessions {
+        let content = content.to_lowercase();
+        let score = tokens
+            .iter()
+            .filter(|token| content.contains(**token))
+            .count();
+        if score > 0 && score >= best_score {
+            best = Some(filename.clone());
+            best_score = score;
+        }
+    }
+    best
+}
+
+fn legacy_decision_dates(content: &str) -> BTreeSet<String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let candidate = line.trim().trim_start_matches('#').trim();
+            let date = candidate.split_whitespace().next()?;
+            valid_decision_date(date).then(|| date.to_string())
+        })
+        .collect()
+}
+
+fn render_decision_dashboard(
+    dashboard: DecisionDashboard,
+    sessions: &[(String, String)],
+    fallback_evidence: Option<(&str, &str)>,
+) -> Result<String, String> {
+    let mut valid_evidence = sessions
+        .iter()
+        .map(|(filename, _)| filename.as_str())
+        .collect::<BTreeSet<_>>();
+    if let Some((filename, _)) = fallback_evidence {
+        valid_evidence.insert(filename);
+    }
+    let allowed_legacy_dates = fallback_evidence
+        .map(|(_, content)| legacy_decision_dates(content))
+        .unwrap_or_default();
+    let mut current = Vec::new();
+    let mut superseded = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for item in dashboard.items {
+        if !decision_is_durable(&item) {
+            continue;
+        }
+        let title = clean_summary_field(&item.title, 140, "");
+        let decision = clean_summary_field(&item.decision, 360, "");
+        if title.is_empty()
+            || decision.is_empty()
+            || !contains_hangul(&title)
+            || !contains_hangul(&decision)
+        {
+            continue;
+        }
+        let mut evidence = item
+            .evidence
+            .iter()
+            .filter_map(|filename| {
+                if valid_evidence.contains(filename.as_str()) {
+                    return Some(filename.clone());
+                }
+                let basename = filename.rsplit('/').next()?;
+                valid_evidence
+                    .iter()
+                    .find(|candidate| candidate.rsplit('/').next() == Some(basename))
+                    .map(|candidate| (*candidate).to_string())
+            })
+            .take(4)
+            .collect::<Vec<_>>();
+        if evidence.is_empty()
+            && let Some(filename) = infer_decision_evidence(&title, &decision, sessions)
+        {
+            evidence.push(filename);
+        }
+        if evidence.is_empty()
+            && let Some((filename, _)) = fallback_evidence
+        {
+            evidence.push(filename.to_string());
+        }
+        if evidence.is_empty() {
+            continue;
+        }
+        let key = format!(
+            "{}:{}",
+            task_title_key(&title),
+            clean_summary_field(&decision, 360, "").to_lowercase()
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        let date = evidence
+            .iter()
+            .filter_map(|filename| session_date(filename))
+            .max()
+            .or_else(|| {
+                allowed_legacy_dates
+                    .contains(item.date.trim())
+                    .then(|| item.date.trim().to_string())
+            })
+            .unwrap_or_else(|| "날짜 미상".into());
+        let mut rationale = clean_summary_field(&item.rationale, 280, "none");
+        if !is_none_value(&rationale) && !contains_hangul(&rationale) {
+            rationale = "none".into();
+        }
+        let entry = (date, title, decision, rationale, evidence);
+        if item.status.eq_ignore_ascii_case("superseded") {
+            superseded.push(entry);
+        } else if item.status.eq_ignore_ascii_case("current") {
+            current.push(entry);
+        }
+    }
+
+    if current.is_empty() && superseded.is_empty() && fallback_evidence.is_some() {
+        return Err("Local model returned no usable legacy decisions".into());
+    }
+
+    let mut output = format!("# Decisions\n\n{DECISIONS_MANAGED_COMMENT}\n\n## 현재 결정\n\n");
+    if current.is_empty() {
+        output.push_str("- 아직 기록된 확정 결정이 없습니다.\n");
+    } else {
+        for (date, title, decision, rationale, evidence) in current {
+            output.push_str(&format!("### {date}: {title}\n\n- 결정: {decision}\n"));
+            if !is_none_value(&rationale) {
+                output.push_str(&format!("- 근거: {rationale}\n"));
+            }
+            output.push_str(&format!(
+                "- 기록: {}\n\n",
+                evidence
+                    .iter()
+                    .map(|filename| format!("`{filename}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    output.push_str("\n## 변경·폐기된 결정\n\n");
+    if superseded.is_empty() {
+        output.push_str("- 아직 기록된 변경·폐기 결정이 없습니다.\n");
+    } else {
+        for (date, title, decision, rationale, evidence) in superseded {
+            output.push_str(&format!("### {date}: {title}\n\n- 이전 결정: {decision}\n"));
+            if !is_none_value(&rationale) {
+                output.push_str(&format!("- 변경 이유: {rationale}\n"));
+            }
+            output.push_str(&format!(
+                "- 기록: {}\n\n",
+                evidence
+                    .iter()
+                    .map(|filename| format!("`{filename}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    if let Some((filename, _)) = fallback_evidence {
+        output.push_str(&format!(
+            "\n## 기존 결정 원문 보관\n\n- 전체 원문: `{filename}`\n"
+        ));
+    }
+    Ok(output)
+}
+
 async fn initialize_local(room: &AiRoom) -> Result<(), ApiError> {
     let room_dir = PathBuf::from(&room.local_root).join(ROOM_DIR);
     fs::create_dir_all(room_dir.join("sessions")).await?;
     fs::create_dir_all(room_dir.join(LIBRARY_DIR)).await?;
+    migrate_root_room_documents(&room_dir).await?;
     for (relative, content) in initial_files(room) {
         let path = room_dir.join(relative);
         if path
@@ -1090,17 +1836,55 @@ async fn initialize_local(room: &AiRoom) -> Result<(), ApiError> {
             fs::write(path, content).await?;
         }
     }
+    let decisions_path = room_dir.join("decisions.md");
+    if let Ok(decisions) = fs::read_to_string(&decisions_path).await
+        && !decisions.contains(DECISIONS_MANAGED_COMMENT)
+        && decisions.trim().len() > "# Decisions".len()
+    {
+        let backup_path = room_dir.join(LEGACY_DECISIONS_FILE);
+        if fs::metadata(&backup_path).await.is_err() {
+            fs::write(backup_path, decisions).await?;
+        }
+    }
     let tasks_path = room_dir.join("tasks.md");
     let tasks = fs::read_to_string(&tasks_path).await.unwrap_or_default();
     let migrated_tasks = ensure_task_update_section(&tasks);
     if migrated_tasks != tasks {
         fs::write(tasks_path, migrated_tasks).await?;
     }
+    if fs::metadata(room_dir.join(SESSION_OVERRIDES_FILE))
+        .await
+        .is_err()
+    {
+        fs::write(room_dir.join(SESSION_OVERRIDES_FILE), "{}\n").await?;
+    }
     let block = managed_agent_block(room);
     for filename in ["AGENTS.md", "CLAUDE.md"] {
         let path = PathBuf::from(&room.local_root).join(filename);
         let existing = fs::read_to_string(&path).await.unwrap_or_default();
         fs::write(path, upsert_managed_block(&existing, &block)).await?;
+    }
+    Ok(())
+}
+
+async fn migrate_root_room_documents(room_dir: &FsPath) -> Result<(), ApiError> {
+    let mut entries = match fs::read_dir(room_dir).await {
+        Ok(entries) => entries,
+        Err(error) => return Err(error.into()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !valid_library_filename(&name) || is_reserved_room_filename(&name) {
+            continue;
+        }
+        let target = room_dir.join(LIBRARY_DIR).join(&name);
+        if fs::metadata(&target).await.is_ok() {
+            continue;
+        }
+        let metadata = entry.metadata().await?;
+        if metadata.is_file() && metadata.len() <= MAX_DOCUMENT_BYTES as u64 {
+            fs::copy(entry.path(), target).await?;
+        }
     }
     Ok(())
 }
@@ -1118,9 +1902,14 @@ async fn prepare_remote(room: &AiRoom, alias: &str, root: &str) -> Result<(), Ap
         .keys()
         .any(|name| name.starts_with("sessions/"))
     {
-        return Err(ApiError::BadRequest(
-            "Server session records already exist. Sync them before preparing again".into(),
-        ));
+        upgrade_remote_instructions(
+            room,
+            alias,
+            root,
+            existing_remote.files.get("ROOM.md").map(String::as_str),
+        )
+        .await?;
+        return Ok(());
     }
 
     let mut files = initial_files(room)
@@ -1482,6 +2271,16 @@ async fn build_snapshot(room: AiRoom) -> AiRoomSnapshot {
                 content: left.clone(),
                 source: "both".into(),
             }),
+            (Some(left), Some(right)) if right.starts_with(left) => sessions.push(AiRoomRecord {
+                filename,
+                content: right.clone(),
+                source: "remote".into(),
+            }),
+            (Some(left), Some(right)) if left.starts_with(right) => sessions.push(AiRoomRecord {
+                filename,
+                content: left.clone(),
+                source: "local".into(),
+            }),
             (Some(left), Some(_)) => {
                 conflicts.push(filename.clone());
                 sessions.push(AiRoomRecord {
@@ -1506,7 +2305,7 @@ async fn build_snapshot(room: AiRoom) -> AiRoomSnapshot {
     let baseline = library_baseline(&remote.files);
     let remote_library = remote_library_documents(&remote.files);
     let mut library = Vec::new();
-    for filename in ["ROOM.md", "context.md", "decisions.md", "tasks.md"] {
+    for filename in ["ROOM.md", "context.md"] {
         match (local.files.get(filename), remote.files.get(filename)) {
             (Some(left), Some(right)) if left == right => library.push(AiRoomRecord {
                 filename: filename.into(),
@@ -1522,6 +2321,21 @@ async fn build_snapshot(room: AiRoom) -> AiRoomSnapshot {
                 });
             }
             (Some(content), None) => library.push(AiRoomRecord {
+                filename: filename.into(),
+                content: content.clone(),
+                source: "local".into(),
+            }),
+            (None, Some(content)) => library.push(AiRoomRecord {
+                filename: filename.into(),
+                content: content.clone(),
+                source: "remote".into(),
+            }),
+            _ => {}
+        }
+    }
+    for filename in ["decisions.md", "tasks.md"] {
+        match (local.files.get(filename), remote.files.get(filename)) {
+            (Some(content), _) => library.push(AiRoomRecord {
                 filename: filename.into(),
                 content: content.clone(),
                 source: "local".into(),
@@ -1590,6 +2404,8 @@ async fn build_snapshot(room: AiRoom) -> AiRoomSnapshot {
         decisions: value("decisions.md"),
         tasks: value("tasks.md"),
         sessions,
+        session_overrides: read_session_overrides(&PathBuf::from(&room.local_root).join(ROOM_DIR))
+            .await,
         library,
         conflicts,
         local: AiRoomEndpointState {
@@ -1661,6 +2477,10 @@ pub fn router() -> Router<DeploymentImpl> {
             "/ai-rooms/{room_id}/import-remote-documents",
             post(import_remote_documents),
         )
+        .route(
+            "/ai-rooms/{room_id}/session-status",
+            put(update_session_status),
+        )
         .route("/ai-rooms/{room_id}/documents/{kind}", put(update_document))
         .route(
             "/ai-rooms/{room_id}/library/{filename}",
@@ -1717,20 +2537,6 @@ mod tests {
             normalized_local_path(FsPath::new(r"\\?\UNC\server\share\project")),
             r"\\server\share\project"
         );
-    }
-
-    #[test]
-    fn accepts_only_append_only_task_updates() {
-        let local = "# Tasks\n\n## AI session updates\n";
-        assert!(is_append_only_update(
-            local,
-            &format!("{local}- [x] one completed session\n")
-        ));
-        assert!(!is_append_only_update(
-            local,
-            "# Tasks\n\nrewritten content\n"
-        ));
-        assert!(!is_append_only_update(local, local));
     }
 
     #[test]
@@ -1875,6 +2681,29 @@ mod tests {
     }
 
     #[test]
+    fn restores_latest_explicit_follow_up_when_model_omits_active_work() {
+        let dashboard = TaskDashboard {
+            items: vec![TaskDashboardItem {
+                status: "completed".into(),
+                title: "exp33 완료".into(),
+                next: "none".into(),
+                blocked: "none".into(),
+            }],
+        };
+        let sessions = vec![(
+            "sessions/20260727-091700-claude-exp33.md".into(),
+            "# Session: exp33\n\n- 후속=pair-identity 분기(exp34+).\n".into(),
+        )];
+        let rendered = render_task_dashboard(ensure_latest_next_action(
+            dashboard,
+            &sessions,
+            &BTreeMap::new(),
+        ))
+        .unwrap();
+        assert!(rendered.contains("- [ ] pair-identity 분기(exp34+)."));
+    }
+
+    #[test]
     fn removes_stopped_sessions_from_model_output() {
         let dashboard = TaskDashboard {
             items: vec![
@@ -1894,14 +2723,70 @@ mod tests {
         };
         let sessions = vec![(
             "sessions/stopped.md".into(),
-            "# Session: FMPose3D service-compatible experiment\n\n## Status\n\n- Stopped by owner.\n"
+            "# Session: FMPose3D service-compatible experiment\n\n## Status\n\n- In progress.\n"
                 .into(),
         )];
+        let overrides = BTreeMap::from([("sessions/stopped.md".into(), "stopped".into())]);
 
         let rendered =
-            render_task_dashboard(remove_stopped_sessions(dashboard, &sessions)).unwrap();
+            render_task_dashboard(remove_stopped_sessions(dashboard, &sessions, &overrides))
+                .unwrap();
         assert!(!rendered.contains("FMPose3D"));
         assert!(rendered.contains("- [x] Keep this result"));
+    }
+
+    #[test]
+    fn renders_only_evidence_backed_decisions() {
+        let sessions = vec![(
+            "sessions/20260727-090000-claude-test.md".into(),
+            "decision evidence".into(),
+        )];
+        let rendered = render_decision_dashboard(
+            DecisionDashboard {
+                items: vec![
+                    DecisionDashboardItem {
+                        date: "2024-10-31".into(),
+                        title: "동기화 방식".into(),
+                        decision: "진행 중 체크포인트를 비파괴 복사한다".into(),
+                        rationale: "강제 종료에도 로컬 기록을 보존한다".into(),
+                        status: "current".into(),
+                        evidence: vec!["20260727-090000-claude-test.md".into()],
+                    },
+                    DecisionDashboardItem {
+                        date: "2026-07-27".into(),
+                        title: "근거 없는 결정".into(),
+                        decision: "포함하면 안 된다".into(),
+                        rationale: "none".into(),
+                        status: "current".into(),
+                        evidence: vec!["sessions/missing.md".into()],
+                    },
+                ],
+            },
+            &sessions,
+            None,
+        )
+        .unwrap();
+        assert!(rendered.contains("### 2026-07-27: 동기화 방식"));
+        assert!(rendered.contains("진행 중 체크포인트를 비파괴 복사한다"));
+        assert!(!rendered.contains("근거 없는 결정"));
+        assert!(rendered.contains(DECISIONS_MANAGED_COMMENT));
+    }
+
+    #[test]
+    fn preserves_explicit_decisions_from_session_checkpoints() {
+        let sessions = vec![(
+            "sessions/20260727-091700-claude-depth-ground-projection.md".into(),
+            "# Session: 깊이 접지 실험\n\n**결정: 단안 3D 접지 접음.**\n\n판정: t=0.5 무조건 이동은 틀린 타깃 → 폐기.\n"
+                .into(),
+        )];
+        let dashboard =
+            augment_explicit_decisions(DecisionDashboard { items: Vec::new() }, &sessions);
+        let rendered = render_decision_dashboard(dashboard, &sessions, None).unwrap();
+
+        assert!(rendered.contains("### 2026-07-27: 깊이 접지 실험 — 명시적 결정"));
+        assert!(rendered.contains("단안 3D 접지 접음."));
+        assert!(rendered.contains("t=0.5 무조건 이동은 틀린 타깃 → 폐기."));
+        assert!(rendered.contains("`sessions/20260727-091700-claude-depth-ground-projection.md`"));
     }
 
     #[test]
@@ -2011,6 +2896,49 @@ mod tests {
         assert_eq!(
             files.files.get("library/review-method.md"),
             Some(&"# Review method".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_forwards_active_remote_session_without_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let room_dir = root.path().join(ROOM_DIR);
+        fs::create_dir_all(room_dir.join("sessions")).await.unwrap();
+        fs::write(room_dir.join("sessions/active.md"), "checkpoint one")
+            .await
+            .unwrap();
+        let room = AiRoom {
+            id: Uuid::nil(),
+            name: "room".into(),
+            description: None,
+            local_root: normalized_local_path(root.path()),
+            ssh_alias: None,
+            remote_root: None,
+            instruction_version: INSTRUCTION_VERSION,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let mut local = read_local_files(&room).await;
+        let remote = EndpointFiles {
+            available: true,
+            files: BTreeMap::from([(
+                "sessions/active.md".into(),
+                "checkpoint one\ncheckpoint two".into(),
+            )]),
+            ..Default::default()
+        };
+
+        let (copied, conflicts) = sync_remote_checkpoints(&room, &mut local, &remote)
+            .await
+            .unwrap();
+
+        assert_eq!(copied, vec!["sessions/active.md"]);
+        assert!(conflicts.is_empty());
+        assert_eq!(
+            fs::read_to_string(room_dir.join("sessions/active.md"))
+                .await
+                .unwrap(),
+            "checkpoint one\ncheckpoint two"
         );
     }
 }

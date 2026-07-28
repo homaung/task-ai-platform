@@ -135,6 +135,7 @@ fn generate_types_content() -> String {
         server::routes::ai_rooms::AiRoomRecord::decl(),
         server::routes::ai_rooms::AiRoomSnapshot::decl(),
         server::routes::ai_rooms::UpdateAiRoomDocumentRequest::decl(),
+        server::routes::ai_rooms::UpdateAiRoomSessionStatusRequest::decl(),
         server::routes::ai_rooms::SyncAiRoomResponse::decl(),
         server::routes::oauth::TokenResponse::decl(),
         server::routes::config::UserSystemInfo::decl(),
