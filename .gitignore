@@ -45,6 +45,9 @@ pids
 *.seed
 *.pid.lock
 
+# AI Room records are private, machine-local runtime data
+/.ai-room/
+
 # Coverage directory used by tools like istanbul
 coverage/
 *.lcov
