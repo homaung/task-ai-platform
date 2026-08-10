@@ -28,6 +28,7 @@ use crate::{
 };
 
 const ROOM_DIR: &str = ".ai-room";
+const ROOM_GITIGNORE_ENTRY: &str = "/.ai-room/";
 const LIBRARY_DIR: &str = "library";
 const LEGACY_DECISIONS_FILE: &str = "library/legacy-decisions.md";
 const LIBRARY_BASELINE_FILE: &str = ".library-baseline.json";
@@ -720,9 +721,9 @@ fn room_instruction(room: &AiRoom) -> String {
 }
 
 fn managed_agent_block(room: &AiRoom) -> String {
+    let _ = room;
     format!(
-        "{START_MARKER}\n## Shared AI Room\n\nThis project belongs to AI Room `{}` (`{}`). Before every task, read `.ai-room/ROOM.md` and follow its session recording workflow. Keep all durable handoff records under `.ai-room`; never put secrets there.\n{END_MARKER}",
-        room.name, room.id
+        "{START_MARKER}\n## Shared AI Room\n\nIf this checkout has a local `.ai-room/ROOM.md`, read it before every task and follow its session recording workflow. AI Room records are private local runtime data and must never be committed to Git.\n{END_MARKER}"
     )
 }
 
@@ -738,6 +739,27 @@ fn upsert_managed_block(existing: &str, block: &str) -> String {
     } else {
         format!("{}\n\n{block}\n", existing.trim_end())
     }
+}
+
+fn ensure_room_gitignore_entry(existing: &str) -> String {
+    let already_ignored = existing.lines().any(|line| {
+        let line = line.trim();
+        !line.starts_with('#')
+            && !line.starts_with('!')
+            && line.trim_start_matches('/').trim_end_matches('/') == ".ai-room"
+    });
+    if already_ignored {
+        return existing.to_string();
+    }
+
+    let prefix = if existing.is_empty() || existing.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    format!(
+        "{existing}{prefix}\n# AI Room records are private, machine-local runtime data\n{ROOM_GITIGNORE_ENTRY}\n"
+    )
 }
 
 fn initial_files(room: &AiRoom) -> Vec<(String, String)> {
@@ -1822,7 +1844,15 @@ fn render_decision_dashboard(
 }
 
 async fn initialize_local(room: &AiRoom) -> Result<(), ApiError> {
-    let room_dir = PathBuf::from(&room.local_root).join(ROOM_DIR);
+    let local_root = PathBuf::from(&room.local_root);
+    let gitignore_path = local_root.join(".gitignore");
+    let gitignore = fs::read_to_string(&gitignore_path).await.unwrap_or_default();
+    let updated_gitignore = ensure_room_gitignore_entry(&gitignore);
+    if updated_gitignore != gitignore {
+        fs::write(gitignore_path, updated_gitignore).await?;
+    }
+
+    let room_dir = local_root.join(ROOM_DIR);
     fs::create_dir_all(room_dir.join("sessions")).await?;
     fs::create_dir_all(room_dir.join(LIBRARY_DIR)).await?;
     migrate_root_room_documents(&room_dir).await?;
@@ -1861,6 +1891,12 @@ async fn initialize_local(room: &AiRoom) -> Result<(), ApiError> {
     let block = managed_agent_block(room);
     for filename in ["AGENTS.md", "CLAUDE.md"] {
         let path = PathBuf::from(&room.local_root).join(filename);
+        if fs::symlink_metadata(&path)
+            .await
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            continue;
+        }
         let existing = fs::read_to_string(&path).await.unwrap_or_default();
         fs::write(path, upsert_managed_block(&existing, &block)).await?;
     }
@@ -2505,6 +2541,22 @@ mod tests {
                 &block
             ),
             format!("before\n{block}\nafter")
+        );
+    }
+
+    #[test]
+    fn keeps_private_room_records_out_of_git() {
+        assert_eq!(
+            ensure_room_gitignore_entry("target/\n"),
+            "target/\n\n# AI Room records are private, machine-local runtime data\n/.ai-room/\n"
+        );
+        assert_eq!(
+            ensure_room_gitignore_entry("target/\n.ai-room/\n"),
+            "target/\n.ai-room/\n"
+        );
+        assert_eq!(
+            ensure_room_gitignore_entry("target/\n/.ai-room\n"),
+            "target/\n/.ai-room\n"
         );
     }
 

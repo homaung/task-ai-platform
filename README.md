@@ -66,14 +66,11 @@ personal data.
 
 ## Continue on another Windows computer
 
-The private Git repository is the portable source of truth for tracked source
-files and `.ai-room` handoff records. It does not synchronize the Codex chat UI,
-authentication, SSH private keys, the Task AI Platform database, or build
-outputs.
+Git synchronizes source code only. `.ai-room/` contains private project context,
+decisions, task state, and session records, so it is excluded from Git and must
+not be committed even when the repository itself is private.
 
-Before changing computers, update the active session record with the current
-goal, completed work, verification, blockers, and the next concrete action,
-then commit and push. On the other computer:
+On the other computer:
 
 ```powershell
 git clone https://github.com/homaung/task-ai-platform.git C:\AI-Workspace\task-ai-platform
@@ -81,10 +78,9 @@ cd C:\AI-Workspace\task-ai-platform
 ```
 
 Configure GitHub, Codex or Claude, Ollama, and SSH locally, then register the
-cloned folder as a local-only AI Room. New agents must read `AGENTS.md` and the
-room records before working. See
-`.ai-room/library/CROSS_COMPUTER_CONTINUITY.md` for the complete handoff
-procedure.
+cloned folder as a local-only AI Room. Room continuity between computers
+requires a separate encrypted export or synchronization mechanism; copying
+Codex state or committing `.ai-room/` is not supported.
 
 ## Development
 
