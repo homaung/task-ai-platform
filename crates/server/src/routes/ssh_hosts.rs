@@ -13,11 +13,12 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
-    time::timeout,
+    time::{Instant, MissedTickBehavior, timeout},
 };
 use ts_rs::TS;
 use utils::{command_ext::NoWindowExt, response::ApiResponse};
@@ -29,8 +30,13 @@ use crate::{
 };
 
 const SSH_TIMEOUT: Duration = Duration::from_secs(15);
+const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const PROGRESS_REMINDER_POLL: Duration = Duration::from_secs(1);
+const PROGRESS_REMINDER_INPUT_IDLE: Duration = Duration::from_secs(2);
 const SAFE_SET_ENV: &str = "SetEnv=TASK_AI_PLATFORM=1";
 const CLEAR_SEND_ENV: &str = "SendEnv=-*";
+const SESSION_START_REMINDER: &str = "프로젝트 작업 전에 가장 가까운 .ai-room/ROOM.md와 library/owner-working-rules.md를 읽으세요. 이 대화창만의 sessions/YYYYMMDD-HHMMSS-agent-random-id/ 폴더를 만드세요. random-id는 임의의 16진수 8자 이상이어야 하며 이미 있는 폴더명은 다시 쓰지 마세요. 그 안에 000001-start.md를 작성한 뒤 작업하세요. 이후 각 사용자 최종 응답 직전에 다음 순번 Markdown 파일을 새로 추가하고, 기존 체크포인트는 절대 수정·교체·삭제하지 마세요. 세션 기록을 5분마다 기계적으로 쓰지는 마세요. 코드나 실행 설정을 변경했다면 완료 응답 전에 library/adversarial-code-review-protocol.md의 독립 감사관 2명과 실행 증거 기반 검토를 반드시 수행하세요.\r";
+const PROGRESS_REMINDER: &str = "지금 하던 작업을 취소하지 말고, 먼저 사용자에게 현재까지 완료한 일, 지금 하는 일, 막힌 점, 다음 할 일을 짧게 중간 보고한 뒤 계속 작업하세요. 세션 파일 기록만 하지 말고 사용자 대화에 직접 보고하세요.\r";
 
 #[derive(Debug, Clone, Serialize, TS)]
 pub struct SshHostSummary {
@@ -151,7 +157,12 @@ fn parse_host_aliases(content: &str) -> Vec<String> {
     let mut aliases = BTreeSet::new();
 
     for raw_line in content.lines() {
-        let line = raw_line.split('#').next().unwrap_or("").trim();
+        let line = raw_line
+            .trim_start_matches('\u{feff}')
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim();
         let Some((keyword, value)) = line
             .split_once(char::is_whitespace)
             .map(|(keyword, value)| (keyword.trim(), value.trim()))
@@ -177,13 +188,97 @@ pub(crate) async fn run_ssh(
     args: &[String],
     command_timeout: Duration,
 ) -> Result<std::process::Output, ApiError> {
-    timeout(
-        command_timeout,
-        Command::new("ssh").args(args).no_window().output(),
-    )
-    .await
-    .map_err(|_| ApiError::BadRequest("SSH command timed out".to_string()))?
-    .map_err(|error| ApiError::BadRequest(format!("Unable to run ssh: {error}")))
+    run_ssh_process(args, None, command_timeout).await
+}
+
+pub(crate) async fn run_ssh_with_stdin(
+    args: &[String],
+    input: &[u8],
+    command_timeout: Duration,
+) -> Result<std::process::Output, ApiError> {
+    run_ssh_process(args, Some(input.to_vec()), command_timeout).await
+}
+
+async fn run_ssh_process(
+    args: &[String],
+    input: Option<Vec<u8>>,
+    command_timeout: Duration,
+) -> Result<std::process::Output, ApiError> {
+    let mut command = Command::new("ssh");
+    command
+        .args(args)
+        .kill_on_drop(true)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .no_window();
+    let mut child = command
+        .spawn()
+        .map_err(|error| ApiError::BadRequest(format!("Unable to run ssh: {error}")))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ApiError::BadRequest("Unable to open SSH output".into()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ApiError::BadRequest("Unable to open SSH error output".into()))?;
+    let stdout_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let stdin_task = input.map(|bytes| {
+        let mut stdin = child.stdin.take().expect("piped SSH stdin");
+        tokio::spawn(async move {
+            stdin.write_all(&bytes).await?;
+            stdin.shutdown().await
+        })
+    });
+
+    let status = match timeout(command_timeout, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            return Err(ApiError::BadRequest(format!("Unable to run ssh: {error}")));
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            if let Some(task) = stdin_task {
+                task.abort();
+            }
+            return Err(ApiError::BadRequest("SSH command timed out".into()));
+        }
+    };
+    if let Some(task) = stdin_task {
+        task.await
+            .map_err(|error| ApiError::BadRequest(format!("SSH input task failed: {error}")))?
+            .map_err(|error| ApiError::BadRequest(format!("Unable to write SSH input: {error}")))?;
+    }
+    let stdout = stdout_task
+        .await
+        .map_err(|error| ApiError::BadRequest(format!("SSH output task failed: {error}")))?
+        .map_err(|error| ApiError::BadRequest(format!("Unable to read SSH output: {error}")))?;
+    let stderr = stderr_task
+        .await
+        .map_err(|error| ApiError::BadRequest(format!("SSH error task failed: {error}")))?
+        .map_err(|error| {
+            ApiError::BadRequest(format!("Unable to read SSH error output: {error}"))
+        })?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn parse_resolved_host(alias: String, output: &str) -> SshHostSummary {
@@ -244,31 +339,33 @@ async fn discovered_hosts() -> Result<SshHostsResponse, ApiError> {
         }
     };
 
-    let aliases = parse_host_aliases(&content);
-    let mut hosts = Vec::with_capacity(aliases.len());
-    for alias in aliases {
-        let args = vec![
-            "-G".to_string(),
-            "-o".to_string(),
-            SAFE_SET_ENV.to_string(),
-            "-o".to_string(),
-            CLEAR_SEND_ENV.to_string(),
-            alias.clone(),
-        ];
-        match run_ssh(&args, Duration::from_secs(3)).await {
-            Ok(output) if output.status.success() => hosts.push(parse_resolved_host(
-                alias,
-                &String::from_utf8_lossy(&output.stdout),
-            )),
-            _ => hosts.push(SshHostSummary {
-                hostname: alias.clone(),
-                alias,
-                user: None,
-                port: None,
-                identity_files: Vec::new(),
+    let hosts = join_all(
+        parse_host_aliases(&content)
+            .into_iter()
+            .map(|alias| async move {
+                let args = vec![
+                    "-G".to_string(),
+                    "-o".to_string(),
+                    SAFE_SET_ENV.to_string(),
+                    "-o".to_string(),
+                    CLEAR_SEND_ENV.to_string(),
+                    alias.clone(),
+                ];
+                match run_ssh(&args, Duration::from_secs(3)).await {
+                    Ok(output) if output.status.success() => {
+                        parse_resolved_host(alias, &String::from_utf8_lossy(&output.stdout))
+                    }
+                    _ => SshHostSummary {
+                        hostname: alias.clone(),
+                        alias,
+                        user: None,
+                        port: None,
+                        identity_files: Vec::new(),
+                    },
+                }
             }),
-        }
-    }
+    )
+    .await;
 
     Ok(SshHostsResponse {
         ssh_available,
@@ -282,11 +379,14 @@ pub(crate) async fn require_registered_alias(alias: &str) -> Result<(), ApiError
         return Err(ApiError::BadRequest("Invalid SSH host alias".to_string()));
     }
 
-    if discovered_hosts()
-        .await?
-        .hosts
+    let path = ssh_config_path()
+        .ok_or_else(|| ApiError::BadRequest("SSH config path is unavailable".to_string()))?;
+    let content = fs::read_to_string(&path).map_err(|error| {
+        ApiError::BadRequest(format!("Unable to read {}: {error}", path.display()))
+    })?;
+    if parse_host_aliases(&content)
         .iter()
-        .any(|host| host.alias == alias)
+        .any(|host| host == alias)
     {
         Ok(())
     } else {
@@ -311,10 +411,16 @@ for tool in git claude codex; do
   tool_path=$(command -v "$tool" 2>/dev/null || true)
   if [ -n "$tool_path" ]; then printf 'tool\t%s\t%s\n' "$tool" "$tool_path"; fi
 done
-for root in "$HOME/works" "$HOME/workspace" "$HOME/workspaces" /workspace /workspaces "$HOME" /srv /opt; do
+{
+for root in "$HOME/works" "$HOME/workspace" "$HOME/workspaces" "$HOME/projects" "$HOME/code" /workspace /workspaces /srv /opt; do
   [ -d "$root" ] || continue
-  find "$root" -maxdepth 4 -type d -name .git -print 2>/dev/null
-done | sed 's#/.git$##' | awk '$0 !~ /\/\.([^/]+)(\/|$)/ && $0 !~ /\/(node_modules|target|vendor)(\/|$)/ && !seen[$0]++' | head -80 | while IFS= read -r repo; do
+  find "$root" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null
+done
+for root in "$HOME/works" "$HOME/workspace" "$HOME/workspaces" "$HOME/projects" "$HOME/code" /workspace /workspaces /srv /opt; do
+  [ -d "$root" ] || continue
+  find "$root" -maxdepth 3 -type d -name .git -print 2>/dev/null
+done
+} | sed 's#/.git$##' | awk '$0 !~ /\/\.([^/]+)(\/|$)/ && $0 !~ /\/(node_modules|target|vendor)(\/|$)/ && !seen[$0]++' | head -80 | while IFS= read -r repo; do
   printf 'repo\t%s\n' "$repo"
 done"#
 }
@@ -634,6 +740,7 @@ async fn handle_ssh_terminal(
     deployment: DeploymentImpl,
     query: SshTerminalQuery,
 ) {
+    let progress_watch_enabled = !matches!(query.tool, SshLaunchTool::Shell);
     let args = vec![
         "-tt".to_string(),
         "-o".to_string(),
@@ -663,6 +770,10 @@ async fn handle_ssh_terminal(
     };
 
     let pty_service = deployment.pty().clone();
+    let mut reminder_timer = tokio::time::interval(PROGRESS_REMINDER_POLL);
+    reminder_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut next_report_deadline: Option<Instant> = None;
+    let mut last_user_input = Instant::now();
     loop {
         tokio::select! {
             maybe_output = output_rx.recv() => {
@@ -681,7 +792,30 @@ async fn handle_ssh_terminal(
                             match command {
                                 TerminalCommand::Input { data } => {
                                     if let Ok(bytes) = BASE64.decode(data) {
+                                        last_user_input = Instant::now();
+                                        let first_task_submission = progress_watch_enabled
+                                            && next_report_deadline.is_none()
+                                            && bytes
+                                                .iter()
+                                                .any(|byte| matches!(*byte, b'\r' | b'\n'));
+                                        if first_task_submission {
+                                            next_report_deadline = Some(
+                                                Instant::now() + PROGRESS_REPORT_INTERVAL
+                                            );
+                                        }
                                         let _ = pty_service.write(session_id, &bytes).await;
+                                        if first_task_submission {
+                                            let notice = "\r\n\x1b[33m[Task AI Platform] AI에게 대화 전용 세션 폴더 생성과 응답 종료 전 새 체크포인트 추가를 요구했습니다.\x1b[0m\r\n";
+                                            let message = TerminalMessage::Output {
+                                                data: BASE64.encode(notice.as_bytes()),
+                                            };
+                                            if let Ok(json) = serde_json::to_string(&message) {
+                                                let _ = socket.send(Message::Text(json.into())).await;
+                                            }
+                                            let _ = pty_service
+                                                .write(session_id, SESSION_START_REMINDER.as_bytes())
+                                                .await;
+                                        }
                                     }
                                 }
                                 TerminalCommand::Resize { cols, rows } => {
@@ -693,6 +827,26 @@ async fn handle_ssh_terminal(
                     Ok(Some(Message::Close(_))) | Ok(None) => break,
                     Ok(Some(_)) => {}
                     Err(_) => break,
+                }
+            }
+            _ = reminder_timer.tick(), if next_report_deadline.is_some() => {
+                let now = Instant::now();
+                if next_report_deadline.is_some_and(|deadline| now >= deadline)
+                    && now.duration_since(last_user_input) >= PROGRESS_REMINDER_INPUT_IDLE
+                {
+                    let notice = "\r\n\x1b[33m[Task AI Platform] 5분이 지나 AI에게 중간 보고를 요청했습니다.\x1b[0m\r\n";
+                    let message = TerminalMessage::Output {
+                        data: BASE64.encode(notice.as_bytes()),
+                    };
+                    if let Ok(json) = serde_json::to_string(&message)
+                        && socket.send(Message::Text(json.into())).await.is_err()
+                    {
+                        break;
+                    }
+                    let _ = pty_service
+                        .write(session_id, PROGRESS_REMINDER.as_bytes())
+                        .await;
+                    next_report_deadline = Some(now + PROGRESS_REPORT_INTERVAL);
                 }
             }
         }
@@ -720,7 +874,27 @@ pub fn router() -> Router<DeploymentImpl> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SshLaunchTool, agent_script, is_safe_alias, parse_host_aliases, posix_quote};
+    use std::time::Duration;
+
+    use super::{
+        PROGRESS_REMINDER, PROGRESS_REPORT_INTERVAL, SESSION_START_REMINDER, SshLaunchTool,
+        agent_script, is_safe_alias, parse_host_aliases, posix_quote,
+    };
+
+    #[test]
+    fn configures_five_minute_runtime_progress_reminders() {
+        assert_eq!(PROGRESS_REPORT_INTERVAL, Duration::from_secs(300));
+        assert!(PROGRESS_REMINDER.contains("중간 보고"));
+        assert!(PROGRESS_REMINDER.contains("사용자 대화에 직접 보고"));
+        assert!(PROGRESS_REMINDER.ends_with('\r'));
+        assert!(SESSION_START_REMINDER.contains("이 대화창만의 sessions/"));
+        assert!(SESSION_START_REMINDER.contains("000001-start.md"));
+        assert!(SESSION_START_REMINDER.contains("기존 체크포인트는 절대 수정·교체·삭제하지 마세요"));
+        assert!(SESSION_START_REMINDER.contains("최종 응답 직전"));
+        assert!(SESSION_START_REMINDER.contains("5분마다 기계적으로 쓰지는"));
+        assert!(SESSION_START_REMINDER.contains("adversarial-code-review-protocol.md"));
+        assert!(SESSION_START_REMINDER.contains("독립 감사관 2명"));
+    }
 
     #[test]
     fn parses_concrete_hosts_and_ignores_patterns() {
@@ -735,6 +909,15 @@ Host !blocked internal-?.example.com
         assert_eq!(
             parse_host_aliases(config),
             vec!["gpu-box".to_string(), "server_250".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_first_host_after_utf8_bom() {
+        let config = "\u{feff}Host intflow-gpu-node\n  HostName example.internal\n\nHost spark23\n";
+        assert_eq!(
+            parse_host_aliases(config),
+            vec!["intflow-gpu-node".to_string(), "spark23".to_string()]
         );
     }
 

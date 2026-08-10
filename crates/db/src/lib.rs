@@ -156,6 +156,7 @@ impl DBService {
 #[cfg(test)]
 mod migration_tests {
     use super::*;
+    use crate::models::ai_room::{AiRoom, AiRoomStorageMode, AiRoomStorageProfile, CreateAiRoom};
 
     #[tokio::test]
     async fn creates_provider_independent_platform_tables() {
@@ -189,5 +190,44 @@ mod migration_tests {
                 .iter()
                 .any(|provider| column.contains(provider))
         }));
+    }
+
+    #[tokio::test]
+    async fn gives_existing_and_new_rooms_stable_local_storage_ownership() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database should open");
+        run_migrations(&pool)
+            .await
+            .expect("all migrations should apply to a clean database");
+
+        let room = AiRoom::create(
+            &pool,
+            CreateAiRoom {
+                name: "local room".into(),
+                description: None,
+                local_root: "C:/work/local-room".into(),
+                ssh_alias: None,
+                remote_root: None,
+                allow_existing_local_root: false,
+            },
+        )
+        .await
+        .expect("room should be created");
+
+        let (identity, profile) = AiRoomStorageProfile::ensure(&pool, room.id)
+            .await
+            .expect("storage profile should be created");
+        let (same_identity, same_profile) = AiRoomStorageProfile::ensure(&pool, room.id)
+            .await
+            .expect("storage profile should be stable");
+
+        assert_eq!(profile.mode, AiRoomStorageMode::LocalOnly);
+        assert_eq!(profile.owner_id, identity.owner_id);
+        assert_eq!(same_identity.owner_id, identity.owner_id);
+        assert_eq!(same_identity.device_id, identity.device_id);
+        assert_eq!(same_profile.room_id, profile.room_id);
     }
 }

@@ -39,12 +39,26 @@ The Cargo build output is named `task-ai-platform.exe`. The stable artifact
 above is copied from that build so it remains easy to find without relying on a
 desktop shortcut.
 
-To enable local session summaries on a new Windows computer:
+Local session summaries are **off by default**. They run a 4B model on this
+machine's own GPU, which keeps it busy for the whole generation, so the app never
+starts them unless you ask for it.
+
+To turn them on for a Windows computer:
 
 ```powershell
 winget install --id Ollama.Ollama -e
 ollama pull qwen3.5:4b
+setx TASK_AI_LOCAL_SUMMARY 1
 ```
+
+Restart the app after setting the variable. Accepted values are `1`, `true`, and
+`on`; anything else leaves the summarizer off. While it is off, `tasks.md` and
+`decisions.md` keep their last generated content and the room screen labels them
+`자동 갱신 꺼짐`.
+
+A room whose dashboard cannot be rebuilt is retried with an exponential backoff
+that starts at five minutes and stops at one hour, so a room that never
+succeeds cannot hold the GPU.
 
 ## AI Room workflow
 
@@ -78,9 +92,10 @@ cd C:\AI-Workspace\task-ai-platform
 ```
 
 Configure GitHub, Codex or Claude, Ollama, and SSH locally, then register the
-cloned folder as a local-only AI Room. Room continuity between computers
-requires a separate encrypted export or synchronization mechanism; copying
-Codex state or committing `.ai-room/` is not supported.
+cloned folder as a local-only AI Room. Cross-computer synchronization of private
+room records is intentionally not bundled with a public cloud provider. Keep
+`.ai-room/` out of Git and use only a private synchronization service that you
+control.
 
 ## Development
 

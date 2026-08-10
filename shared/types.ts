@@ -6,7 +6,13 @@
 
 export type AiRoom = { id: string, name: string, description: string | null, local_root: string, ssh_alias: string | null, remote_root: string | null, instruction_version: bigint, created_at: string, updated_at: string, };
 
-export type CreateAiRoom = { name: string, description: string | null, local_root: string, ssh_alias: string | null, remote_root: string | null, };
+export type CreateAiRoom = { name: string, description: string | null, local_root: string, ssh_alias: string | null, remote_root: string | null, allow_existing_local_root: boolean, };
+
+export type AiRoomStorageMode = "LOCAL_ONLY" | "TASK_AI_CLOUD" | "PERSONAL_HUB";
+
+export type AiRoomLocalIdentity = { owner_id: string, device_id: string, device_name: string, created_at: string, updated_at: string, };
+
+export type AiRoomStorageProfile = { room_id: string, owner_id: string, mode: AiRoomStorageMode, endpoint: string | null, created_at: string, updated_at: string, };
 
 export type Repo = { id: string, path: string, name: string, display_name: string, setup_script: string | null, cleanup_script: string | null, archive_script: string | null, copy_files: string | null, parallel_setup_script: boolean, dev_server_script: string | null, default_target_branch: string | null, default_working_dir: string | null, created_at: Date, updated_at: Date, };
 
@@ -342,13 +348,26 @@ export type AiRoomEndpointState = { configured: boolean, available: boolean, ins
 
 export type AiRoomRecord = { filename: string, content: string, source: string, };
 
-export type AiRoomSnapshot = { room: AiRoom, instruction: string, context: string, decisions: string, tasks: string, sessions: Array<AiRoomRecord>, session_overrides: { [key in string]?: string }, library: Array<AiRoomRecord>, conflicts: Array<string>, local: AiRoomEndpointState, remote: AiRoomEndpointState, };
+export type AiRoomCheckpointHealth = { status: string, active_sessions: number, overdue_sessions: number, latest_session: string | null, latest_checkpoint_age_seconds: number | null, overdue_after_minutes: number, unrecorded_activity: boolean, local_activity_age_seconds: number | null, remote_activity_age_seconds: number | null, };
+
+export type AiRoomSnapshot = { room: AiRoom, instruction: string, context: string, decisions: string, tasks: string, sessions: Array<AiRoomRecord>, checkpoint_health: AiRoomCheckpointHealth, 
+/**
+ * False while the local model dashboard is off, so the UI can say that
+ * `tasks.md` and `decisions.md` are no longer rebuilt automatically.
+ */
+local_summary_enabled: boolean, session_overrides: { [key in string]?: string }, library: Array<AiRoomRecord>, conflicts: Array<string>, local: AiRoomEndpointState, remote: AiRoomEndpointState, };
 
 export type UpdateAiRoomDocumentRequest = { content: string, };
 
 export type UpdateAiRoomSessionStatusRequest = { filename: string, status: string | null, };
 
+export type UpdateAiRoomProfileRequest = { name: string, description: string | null, };
+
+export type UpdateAiRoomConnectionRequest = { ssh_alias: string | null, remote_root: string | null, force: boolean, };
+
 export type SyncAiRoomResponse = { copied_to_local: Array<string>, copied_to_remote: Array<string>, removed_from_remote: Array<string>, conflicts: Array<string>, snapshot: AiRoomSnapshot, };
+
+export type AiRoomStorageStatus = { identity: AiRoomLocalIdentity, profile: AiRoomStorageProfile, task_ai_cloud_available: boolean, personal_hub_available: boolean, };
 
 export type TokenResponse = { access_token: string, expires_at: string | null, };
 

@@ -30,6 +30,8 @@ const LOCAL_ONLY_API_PREFIXES = [
   '/api/relay-auth/server/',
   '/api/relay-auth/client/',
   '/api/ssh/',
+  '/api/ai-room-drive/',
+  '/api/ai-rooms',
 ];
 
 function isAbsoluteUrl(pathOrUrl: string): boolean {

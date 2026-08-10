@@ -3,8 +3,11 @@
 import {
   AiRoom,
   AiRoomSnapshot,
+  AiRoomStorageStatus,
   CreateAiRoom,
   SyncAiRoomResponse,
+  UpdateAiRoomConnectionRequest,
+  UpdateAiRoomProfileRequest,
   UpdateAiRoomSessionStatusRequest,
   ApprovalStatus,
   ApiResponse,
@@ -1845,9 +1848,36 @@ export const aiRoomsApi = {
     return handleApiResponse<AiRoomSnapshot>(response);
   },
 
+  storage: async (roomId: string): Promise<AiRoomStorageStatus> => {
+    const response = await makeRequest(`/api/ai-rooms/${roomId}/storage`);
+    return handleApiResponse<AiRoomStorageStatus>(response);
+  },
+
   initialize: async (roomId: string): Promise<AiRoomSnapshot> => {
     const response = await makeRequest(`/api/ai-rooms/${roomId}/initialize`, {
       method: 'POST',
+    });
+    return handleApiResponse<AiRoomSnapshot>(response);
+  },
+
+  updateProfile: async (
+    roomId: string,
+    data: UpdateAiRoomProfileRequest
+  ): Promise<AiRoomSnapshot> => {
+    const response = await makeRequest(`/api/ai-rooms/${roomId}/profile`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    });
+    return handleApiResponse<AiRoomSnapshot>(response);
+  },
+
+  updateConnection: async (
+    roomId: string,
+    data: UpdateAiRoomConnectionRequest
+  ): Promise<AiRoomSnapshot> => {
+    const response = await makeRequest(`/api/ai-rooms/${roomId}/connection`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
     });
     return handleApiResponse<AiRoomSnapshot>(response);
   },

@@ -165,6 +165,7 @@ function SshTerminal({
         <TerminalWindowIcon className="size-icon-sm text-brand" weight="bold" />
         <span className="min-w-0 flex-1 truncate font-mono text-sm text-high">
           {alias}:{path} · {tool}
+          {tool !== 'shell' && ' · 세션 기록·5분 보고 감시 중'}
         </span>
         <button
           type="button"

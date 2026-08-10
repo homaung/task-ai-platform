@@ -12,11 +12,11 @@ use axum::{
     routing::{get, post, put},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use db::models::ai_room::{AiRoom, CreateAiRoom};
+use db::models::ai_room::{AiRoom, AiRoomLocalIdentity, AiRoomStorageProfile, CreateAiRoom};
 use deployment::Deployment;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{fs, sync::Mutex};
+use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
 use ts_rs::TS;
 use utils::response::ApiResponse;
 use uuid::Uuid;
@@ -24,36 +24,82 @@ use uuid::Uuid;
 use crate::{
     DeploymentImpl,
     error::ApiError,
-    routes::ssh_hosts::{posix_quote, remote_shell_command, require_registered_alias, run_ssh},
+    routes::ssh_hosts::{
+        posix_quote, remote_shell_command, require_registered_alias, run_ssh, run_ssh_with_stdin,
+    },
 };
 
 const ROOM_DIR: &str = ".ai-room";
 const ROOM_GITIGNORE_ENTRY: &str = "/.ai-room/";
 const LIBRARY_DIR: &str = "library";
+const OWNER_RULES_NAME: &str = "owner-working-rules.md";
+const OWNER_RULES_FILE: &str = "library/owner-working-rules.md";
+const ADVERSARIAL_REVIEW_NAME: &str = "adversarial-code-review-protocol.md";
+const ADVERSARIAL_REVIEW_FILE: &str = "library/adversarial-code-review-protocol.md";
+const LOCAL_HISTORY_DIR: &str = "local-history";
 const LEGACY_DECISIONS_FILE: &str = "library/legacy-decisions.md";
 const LIBRARY_BASELINE_FILE: &str = ".library-baseline.json";
 const SESSION_OVERRIDES_FILE: &str = "session-overrides.json";
 const DECISIONS_MANAGED_COMMENT: &str =
     "<!-- Task AI Platform가 안정된 AI 작업 기록에서 확정된 결정을 자동 정리합니다. -->";
-const INSTRUCTION_VERSION: i64 = 7;
+const INSTRUCTION_VERSION: i64 = 16;
 const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
 const CLEAR_SEND_ENV: &str = "SendEnv=-*";
 const START_MARKER: &str = "<!-- task-ai-room:start -->";
 const END_MARKER: &str = "<!-- task-ai-room:end -->";
 const SESSION_COMPLETE_MARKER: &str = "<!-- task-ai-room:complete -->";
+const SESSION_INDEX_FILE: &str = "INDEX.md";
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(15);
 const TASK_SUMMARY_INTERVAL: Duration = Duration::from_secs(45);
 const SESSION_STABLE_AFTER: Duration = Duration::from_secs(120);
+const CHECKPOINT_OVERDUE_AFTER: Duration = Duration::from_secs(10 * 60);
+const ACTIVITY_RECENT_WINDOW: Duration = Duration::from_secs(30 * 60);
+const REMOTE_ACTIVITY_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const LOCAL_ACTIVITY_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const ACTIVITY_SCAN_MAX_ENTRIES: usize = 20_000;
+const ACTIVITY_SCAN_MAX_DEPTH: usize = 5;
+const ACTIVITY_EXCLUDED_DIRS: &[&str] = &[
+    ".ai-room",
+    ".git",
+    ".claude",
+    ".codex",
+    ".cache",
+    ".venv",
+    ".next",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    "venv",
+];
+/// A room whose dashboard rebuild keeps failing must not retry every
+/// `TASK_SUMMARY_INTERVAL`. The local model holds the GPU for the whole
+/// generation, so an unconvergeable room would pin it permanently.
+const SUMMARY_RETRY_BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
+const SUMMARY_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
+const LOCAL_SUMMARY_ENV: &str = "TASK_AI_LOCAL_SUMMARY";
 const TASK_SUMMARY_STATE_FILE: &str = "task-summary-state.json";
 const TASK_DASHBOARD_VERSION: u8 = 7;
 const DECISION_DASHBOARD_VERSION: u8 = 4;
+const LOCAL_ROOT_NOT_EMPTY_MARKER: &str = "LOCAL_ROOT_NOT_EMPTY";
+const SERVER_NOT_PREPARED_ERROR: &str = "Server is not prepared for an AI room yet";
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_TASK_SUMMARY_MODEL: &str = "qwen3.5:4b";
 const MAX_SESSION_PROMPT_BYTES: usize = 96 * 1024;
 const MAX_TASKS_PROMPT_BYTES: usize = 32 * 1024;
 const MAX_DECISIONS_PROMPT_BYTES: usize = 48 * 1024;
 static SYNC_LOCK: Mutex<()> = Mutex::const_new(());
+static SESSION_OVERRIDE_LOCK: Mutex<()> = Mutex::const_new(());
 static TASK_SUMMARY_LOCK: Mutex<()> = Mutex::const_new(());
+static REMOTE_ACTIVITY: Mutex<BTreeMap<Uuid, (SystemTime, Option<SystemTime>)>> =
+    Mutex::const_new(BTreeMap::new());
+static LOCAL_ACTIVITY: Mutex<BTreeMap<Uuid, (SystemTime, Option<SystemTime>)>> =
+    Mutex::const_new(BTreeMap::new());
+/// Consecutive dashboard failures per room and the time its next attempt is
+/// allowed. Cleared as soon as a room summarizes successfully.
+static SUMMARY_BACKOFF: Mutex<BTreeMap<Uuid, (u32, SystemTime)>> =
+    Mutex::const_new(BTreeMap::new());
 
 #[derive(Debug, Clone, Serialize, TS)]
 pub struct AiRoomEndpointState {
@@ -71,6 +117,19 @@ pub struct AiRoomRecord {
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
+pub struct AiRoomCheckpointHealth {
+    pub status: String,
+    pub active_sessions: usize,
+    pub overdue_sessions: usize,
+    pub latest_session: Option<String>,
+    pub latest_checkpoint_age_seconds: Option<u32>,
+    pub overdue_after_minutes: u32,
+    pub unrecorded_activity: bool,
+    pub local_activity_age_seconds: Option<u32>,
+    pub remote_activity_age_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
 pub struct AiRoomSnapshot {
     pub room: AiRoom,
     pub instruction: String,
@@ -78,6 +137,10 @@ pub struct AiRoomSnapshot {
     pub decisions: String,
     pub tasks: String,
     pub sessions: Vec<AiRoomRecord>,
+    pub checkpoint_health: AiRoomCheckpointHealth,
+    /// False while the local model dashboard is off, so the UI can say that
+    /// `tasks.md` and `decisions.md` are no longer rebuilt automatically.
+    pub local_summary_enabled: bool,
     pub session_overrides: BTreeMap<String, String>,
     pub library: Vec<AiRoomRecord>,
     pub conflicts: Vec<String>,
@@ -96,6 +159,20 @@ pub struct UpdateAiRoomSessionStatusRequest {
     pub status: Option<String>,
 }
 
+#[derive(Debug, Deserialize, TS)]
+pub struct UpdateAiRoomProfileRequest {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Deserialize, TS)]
+pub struct UpdateAiRoomConnectionRequest {
+    pub ssh_alias: Option<String>,
+    pub remote_root: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+}
+
 #[derive(Debug, Serialize, TS)]
 pub struct SyncAiRoomResponse {
     pub copied_to_local: Vec<String>,
@@ -103,6 +180,14 @@ pub struct SyncAiRoomResponse {
     pub removed_from_remote: Vec<String>,
     pub conflicts: Vec<String>,
     pub snapshot: AiRoomSnapshot,
+}
+
+#[derive(Debug, Serialize, TS)]
+pub struct AiRoomStorageStatus {
+    pub identity: AiRoomLocalIdentity,
+    pub profile: AiRoomStorageProfile,
+    pub task_ai_cloud_available: bool,
+    pub personal_hub_available: bool,
 }
 
 #[derive(Debug, Default)]
@@ -177,16 +262,6 @@ pub async fn create_room(
         ));
     }
 
-    let local_root = fs::canonicalize(&payload.local_root)
-        .await
-        .map_err(|error| ApiError::BadRequest(format!("Local root is not accessible: {error}")))?;
-    if !fs::metadata(&local_root).await?.is_dir() {
-        return Err(ApiError::BadRequest(
-            "Local root must be a directory".into(),
-        ));
-    }
-    payload.local_root = normalized_local_path(&local_root);
-
     match (&payload.ssh_alias, &payload.remote_root) {
         (Some(alias), Some(root)) => {
             require_registered_alias(alias).await?;
@@ -200,8 +275,87 @@ pub async fn create_room(
         }
     }
 
-    let room = AiRoom::create(&deployment.db().pool, payload).await?;
+    let requested_root = PathBuf::from(payload.local_root.trim());
+    if requested_root.as_os_str().is_empty() {
+        return Err(ApiError::BadRequest("Local root is required".into()));
+    }
+    let created_root =
+        prepare_local_root(&requested_root, payload.allow_existing_local_root).await?;
+    let local_root = fs::canonicalize(&requested_root)
+        .await
+        .map_err(|error| ApiError::BadRequest(format!("Local root is not accessible: {error}")))?;
+    payload.local_root = normalized_local_path(&local_root);
+
+    if AiRoom::find_all(&deployment.db().pool)
+        .await?
+        .iter()
+        .any(|room| same_local_root(&room.local_root, &payload.local_root))
+    {
+        if created_root {
+            let _ = fs::remove_dir(&local_root).await;
+        }
+        return Err(ApiError::Conflict(
+            "This local folder is already connected to an AI Room".into(),
+        ));
+    }
+
+    let room = match AiRoom::create(&deployment.db().pool, payload).await {
+        Ok(room) => room,
+        Err(error) => {
+            if created_root {
+                let _ = fs::remove_dir(&local_root).await;
+            }
+            return Err(error.into());
+        }
+    };
     Ok(ResponseJson(ApiResponse::success(room)))
+}
+
+async fn prepare_local_root(path: &FsPath, allow_existing: bool) -> Result<bool, ApiError> {
+    match fs::metadata(path).await {
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(ApiError::BadRequest(
+                "Local root points to a file, not a directory".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).await.map_err(|error| {
+                ApiError::BadRequest(format!("Unable to create local root: {error}"))
+            })?;
+            return Ok(true);
+        }
+        Err(error) => {
+            return Err(ApiError::BadRequest(format!(
+                "Local root is not accessible: {error}"
+            )));
+        }
+    }
+
+    if fs::metadata(path.join(ROOM_DIR).join("room.json"))
+        .await
+        .is_ok()
+    {
+        return Err(ApiError::Conflict(
+            "This folder already contains another AI Room installation".into(),
+        ));
+    }
+
+    let mut entries = fs::read_dir(path).await?;
+    if entries.next_entry().await?.is_some() && !allow_existing {
+        return Err(ApiError::Conflict(format!(
+            "{LOCAL_ROOT_NOT_EMPTY_MARKER}: The selected local folder contains existing files"
+        )));
+    }
+    Ok(false)
+}
+
+fn same_local_root(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
 }
 
 pub async fn get_room_snapshot(
@@ -214,16 +368,174 @@ pub async fn get_room_snapshot(
     )))
 }
 
+pub async fn get_room_storage(
+    State(deployment): State<DeploymentImpl>,
+    Path(room_id): Path<Uuid>,
+) -> Result<ResponseJson<ApiResponse<AiRoomStorageStatus>>, ApiError> {
+    find_room(&deployment, room_id).await?;
+    let (identity, profile) = AiRoomStorageProfile::ensure(&deployment.db().pool, room_id).await?;
+
+    Ok(ResponseJson(ApiResponse::success(AiRoomStorageStatus {
+        identity,
+        profile,
+        task_ai_cloud_available: false,
+        personal_hub_available: false,
+    })))
+}
+
 pub async fn initialize_room(
     State(deployment): State<DeploymentImpl>,
     Path(room_id): Path<Uuid>,
 ) -> Result<ResponseJson<ApiResponse<AiRoomSnapshot>>, ApiError> {
+    let _guard = SYNC_LOCK.lock().await;
     let room = find_room(&deployment, room_id).await?;
     initialize_local(&room).await?;
-    AiRoom::touch(&deployment.db().pool, room.id).await?;
+    AiRoom::set_instruction_version(&deployment.db().pool, room.id, INSTRUCTION_VERSION).await?;
     let room = find_room(&deployment, room_id).await?;
     Ok(ResponseJson(ApiResponse::success(
         build_snapshot(room).await,
+    )))
+}
+
+pub async fn update_room_profile(
+    State(deployment): State<DeploymentImpl>,
+    Path(room_id): Path<Uuid>,
+    Json(payload): Json<UpdateAiRoomProfileRequest>,
+) -> Result<ResponseJson<ApiResponse<AiRoomSnapshot>>, ApiError> {
+    let name = payload.name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 200 {
+        return Err(ApiError::BadRequest("룸 이름은 1~200자여야 합니다".into()));
+    }
+    let description = payload
+        .description
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if description
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > 2000)
+    {
+        return Err(ApiError::BadRequest(
+            "룸 설명은 2000자 이하여야 합니다".into(),
+        ));
+    }
+    // Remote instruction writes must not race the 15-second sync loop, which
+    // holds the same lock while rewriting ROOM.md/AGENTS.md/CLAUDE.md.
+    let _guard = SYNC_LOCK.lock().await;
+    let previous = find_room(&deployment, room_id).await?;
+    let updated = AiRoom::update_profile(&deployment.db().pool, room_id, name, description).await?;
+    // Rewrite the local ROOM.md / room.json so the new name is durable. If the
+    // local rewrite fails, restore the previous profile so the database and
+    // the on-disk instruction cannot diverge permanently.
+    if let Err(error) = initialize_local(&updated).await {
+        let _ = AiRoom::update_profile(
+            &deployment.db().pool,
+            room_id,
+            previous.name,
+            previous.description,
+        )
+        .await;
+        return Err(ApiError::BadRequest(format!(
+            "로컬 설명서를 다시 쓰지 못해 변경을 되돌렸습니다: {error}"
+        )));
+    }
+    // Push the renamed instructions to a reachable server right away; the
+    // 15-second sync would repair it later anyway via the content diff.
+    if let (Some(alias), Some(root)) = (&updated.ssh_alias, &updated.remote_root) {
+        let remote = read_remote_files(&updated).await;
+        if remote.available
+            && let Err(error) = upgrade_remote_instructions(
+                &updated,
+                alias,
+                root,
+                &remote.files,
+            )
+            .await
+        {
+            tracing::warn!("AI Room could not push renamed instructions to the server: {error}");
+        }
+    }
+    Ok(ResponseJson(ApiResponse::success(
+        build_snapshot(updated).await,
+    )))
+}
+
+pub async fn update_room_connection(
+    State(deployment): State<DeploymentImpl>,
+    Path(room_id): Path<Uuid>,
+    Json(payload): Json<UpdateAiRoomConnectionRequest>,
+) -> Result<ResponseJson<ApiResponse<AiRoomSnapshot>>, ApiError> {
+    let _guard = SYNC_LOCK.lock().await;
+    let old_room = find_room(&deployment, room_id).await?;
+    let ssh_alias = payload
+        .ssh_alias
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let remote_root = payload
+        .remote_root
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match (&ssh_alias, &remote_root) {
+        (Some(alias), Some(root)) => {
+            require_registered_alias(alias).await?;
+            validate_remote_root(root)?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(ApiError::BadRequest(
+                "SSH alias and remote root must be configured together".into(),
+            ));
+        }
+    }
+    if old_room.ssh_alias == ssh_alias && old_room.remote_root == remote_root {
+        return Ok(ResponseJson(ApiResponse::success(
+            build_snapshot(old_room).await,
+        )));
+    }
+
+    if old_room.ssh_alias.is_some() && old_room.remote_root.is_some() {
+        let old_remote = read_remote_files(&old_room).await;
+        let has_no_active_room = old_remote.error.as_deref() == Some(SERVER_NOT_PREPARED_ERROR);
+        if !has_no_active_room
+            && let Err(error) = sync_room_internal(&deployment, old_room.clone()).await
+            && !payload.force
+        {
+            return Err(ApiError::BadRequest(format!(
+                "기존 서버의 최신 기록을 가져오지 못해 변경을 중단했습니다. 다시 연결하거나 강제 변경을 선택하세요: {error}"
+            )));
+        }
+    }
+
+    let updated = AiRoom::update_connection(
+        &deployment.db().pool,
+        room_id,
+        ssh_alias.clone(),
+        remote_root.clone(),
+    )
+    .await?;
+    initialize_local(&updated).await?;
+    if let (Some(alias), Some(root)) = (&ssh_alias, &remote_root)
+        && let Err(error) = prepare_remote(&updated, alias, root).await
+    {
+        let restored = AiRoom::update_connection(
+            &deployment.db().pool,
+            room_id,
+            old_room.ssh_alias.clone(),
+            old_room.remote_root.clone(),
+        )
+        .await?;
+        let _ = initialize_local(&restored).await;
+        return Err(ApiError::BadRequest(format!(
+            "새 서버 준비에 실패해 기존 연결로 되돌렸습니다: {error}"
+        )));
+    }
+
+    // The room now points at a different server, so the cached activity
+    // observation from the previous connection no longer applies.
+    REMOTE_ACTIVITY.lock().await.remove(&room_id);
+
+    let updated = find_room(&deployment, room_id).await?;
+    Ok(ResponseJson(ApiResponse::success(
+        build_snapshot(updated).await,
     )))
 }
 
@@ -271,10 +583,9 @@ pub async fn update_session_status(
     Path(room_id): Path<Uuid>,
     Json(payload): Json<UpdateAiRoomSessionStatusRequest>,
 ) -> Result<ResponseJson<ApiResponse<AiRoomSnapshot>>, ApiError> {
-    if !payload.filename.starts_with("sessions/")
-        || !payload.filename.ends_with(".md")
+    if (!is_session_record_path(&payload.filename)
+        && !is_session_conversation_path(&payload.filename))
         || payload.filename.contains(['\\', '\0', '\r', '\n'])
-        || payload.filename["sessions/".len()..].contains('/')
     {
         return Err(ApiError::BadRequest("Invalid session filename".into()));
     }
@@ -293,6 +604,7 @@ pub async fn update_session_status(
     {
         return Err(ApiError::BadRequest("Session record not found".into()));
     }
+    let override_guard = SESSION_OVERRIDE_LOCK.lock().await;
     let mut overrides = read_session_overrides(&room_dir).await;
     if let Some(status) = status {
         overrides.insert(payload.filename, status);
@@ -300,6 +612,7 @@ pub async fn update_session_status(
         overrides.remove(&payload.filename);
     }
     write_session_overrides(&room_dir, &overrides).await?;
+    drop(override_guard);
     AiRoom::touch(&deployment.db().pool, room.id).await?;
     let room = find_room(&deployment, room_id).await?;
     Ok(ResponseJson(ApiResponse::success(
@@ -402,7 +715,7 @@ async fn sync_room_internal(
     let mut local = read_local_files(&room).await;
     let mut copied_to_local = Vec::new();
     let copied_to_remote = Vec::new();
-    let mut removed_from_remote = Vec::new();
+    let removed_from_remote = Vec::new();
     let mut conflicts = Vec::new();
 
     if let (Some(alias), Some(root)) = (&room.ssh_alias, &room.remote_root) {
@@ -418,16 +731,19 @@ async fn sync_room_internal(
         copied_to_local.extend(checkpoint_copies);
         conflicts.extend(checkpoint_conflicts);
 
-        if all_remote_sessions_complete(&remote.files) && conflicts.is_empty() {
-            removed_from_remote = clean_remote_room(alias, root, &remote.files).await?;
-        } else if !all_remote_sessions_complete(&remote.files) {
-            upgrade_remote_instructions(
-                &room,
-                alias,
-                root,
-                remote.files.get("ROOM.md").map(String::as_str),
-            )
-            .await?;
+        // Server rooms are persistent by owner decision (2026-08-06): records
+        // stay resident on the server and are never cleaned up automatically.
+        // An instruction-upgrade failure must not fail the whole sync — the
+        // checkpoint copies above already happened, so report and continue.
+        if let Err(error) = upgrade_remote_instructions(
+            &room,
+            alias,
+            root,
+            &remote.files,
+        )
+        .await
+        {
+            tracing::warn!("AI Room could not upgrade server instructions during sync: {error}");
         }
     }
 
@@ -455,42 +771,65 @@ async fn sync_remote_checkpoints(
     for (filename, content) in remote
         .files
         .iter()
-        .filter(|(name, _)| name.starts_with("sessions/"))
+        .filter(|(name, _)| is_session_record_path(name))
     {
         match local.files.get(filename) {
             None => {
-                write_local_file(room, filename, content).await?;
-                local.files.insert(filename.clone(), content.clone());
-                copied.push(filename.clone());
+                if create_local_session_record(room, filename, content).await? {
+                    local.files.insert(filename.clone(), content.clone());
+                    copied.push(filename.clone());
+                } else {
+                    let path = safe_room_path(room, filename)?;
+                    let current = fs::read_to_string(path).await?;
+                    local.files.insert(filename.clone(), current.clone());
+                    if current != *content {
+                        conflicts.push(filename.clone());
+                    }
+                }
             }
             Some(local_content) if local_content == content => {}
-            Some(local_content) if content.starts_with(local_content) => {
-                write_local_file(room, filename, content).await?;
-                local.files.insert(filename.clone(), content.clone());
-                copied.push(filename.clone());
+            Some(local_content) => {
+                // Every session record is immutable, including legacy flat
+                // files. Preserve the local body and surface the divergent
+                // path instead of replacing history in place.
+                preserve_local_version(room, filename, local_content).await?;
+                conflicts.push(filename.clone());
             }
-            Some(local_content) if local_content.starts_with(content) => {}
-            Some(local_content)
-                if session_status(local_content)
-                    .is_some_and(|status| status_is_stopped(&status)) => {}
-            Some(_) => conflicts.push(filename.clone()),
         }
     }
 
+    // context.md is owner-authored and edited locally; the local copy is
+    // canonical. When the two sides differ, the room synchronization sends
+    // the local version to the room's own prepared server workspace so a
+    // stale server copy can no longer erase the owner's edits.
     if let (Some(local_context), Some(remote_context)) = (
         local.files.get("context.md"),
         remote.files.get("context.md"),
     ) && local_context != remote_context
+        && let (Some(alias), Some(root)) = (&room.ssh_alias, &room.remote_root)
     {
-        if remote_context.starts_with(local_context) {
-            write_local_file(room, "context.md", remote_context).await?;
-            local
-                .files
-                .insert("context.md".into(), remote_context.clone());
-            copied.push("context.md".into());
-        } else {
-            conflicts.push("context.md".into());
-        }
+        // Archive the losing server copy exactly like sessions and library
+        // documents, so no divergent version is ever lost without a trace.
+        preserve_local_version(room, "context.md", remote_context).await?;
+        // Detached like refresh_remote_activity: callers hold the global sync
+        // lock, so an unreachable host must not stall every room's sync for
+        // the SSH timeout. While the sides still differ, the next cycle
+        // retries naturally.
+        let alias = alias.clone();
+        let root = root.clone();
+        let update = vec![("context.md".to_string(), local_context.clone())];
+        tokio::spawn(async move {
+            match write_remote_files(&alias, &root, &update).await {
+                Ok(()) => {
+                    tracing::info!("AI Room updated the server copy of context.md");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "AI Room could not update the server copy of context.md: {error}"
+                    );
+                }
+            }
+        });
     }
 
     if let (Some(local_decisions), Some(remote_decisions)) = (
@@ -524,30 +863,57 @@ async fn upgrade_remote_instructions(
     room: &AiRoom,
     alias: &str,
     root: &str,
-    current_instruction: Option<&str>,
+    current_files: &BTreeMap<String, String>,
 ) -> Result<(), ApiError> {
-    let instruction = room_instruction(room);
-    if current_instruction == Some(instruction.as_str()) {
+    if room.instruction_version > INSTRUCTION_VERSION {
         return Ok(());
     }
+    let instruction = room_instruction(room);
     let manifest = serde_json::json!({
         "room_id": room.id,
         "name": room.name,
         "instruction_version": INSTRUCTION_VERSION,
     });
     let block = managed_agent_block(room);
-    let mut files = vec![
+    let owner_rules = fs::read_to_string(
+        PathBuf::from(&room.local_root)
+            .join(ROOM_DIR)
+            .join(OWNER_RULES_FILE),
+    )
+    .await
+    .unwrap_or_else(|_| owner_working_rules(&[]));
+    let adversarial_review = fs::read_to_string(
+        PathBuf::from(&room.local_root)
+            .join(ROOM_DIR)
+            .join(ADVERSARIAL_REVIEW_FILE),
+    )
+    .await
+    .unwrap_or_else(|_| adversarial_code_review_protocol().into());
+    let desired = vec![
         (
             "room.json".into(),
             serde_json::to_string_pretty(&manifest).unwrap(),
         ),
         ("ROOM.md".into(), instruction),
+        (OWNER_RULES_FILE.into(), owner_rules),
+        (ADVERSARIAL_REVIEW_FILE.into(), adversarial_review),
     ];
+    let mut files = desired
+        .into_iter()
+        .filter(|(name, content)| current_files.get(name) != Some(content))
+        .collect::<Vec<_>>();
     for filename in ["AGENTS.md", "CLAUDE.md"] {
-        let existing = read_remote_root_file(alias, root, filename)
-            .await
+        let existing = current_files
+            .get(&format!("project-root/{filename}"))
+            .cloned()
             .unwrap_or_default();
-        files.push((filename.into(), upsert_managed_block(&existing, &block)));
+        let desired = upsert_managed_block(&existing, &block);
+        if desired != existing {
+            files.push((filename.into(), desired));
+        }
+    }
+    if files.is_empty() {
+        return Ok(());
     }
     write_remote_files(alias, root, &files).await
 }
@@ -560,6 +926,11 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
 
         loop {
             interval.tick().await;
+            // The local model dashboard runs a 4B model on this machine's own
+            // GPU. It stays idle unless the owner opts in.
+            if !local_summary_enabled() {
+                continue;
+            }
             let _guard = TASK_SUMMARY_LOCK.lock().await;
             if let Err(error) = summarize_pending_sessions(&summary_deployment).await {
                 tracing::debug!("AI Room local task summarizer is waiting: {error}");
@@ -570,11 +941,26 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
     tokio::spawn(async move {
         match AiRoom::find_all(&deployment.db().pool).await {
             Ok(rooms) => {
-                for room in rooms {
+                for room in rooms
+                    .into_iter()
+                    .filter(|room| room.instruction_version < INSTRUCTION_VERSION)
+                {
+                    let _guard = SYNC_LOCK.lock().await;
                     if let Err(error) = initialize_local(&room).await {
                         tracing::warn!(
                             room_id = %room.id,
                             "AI Room instructions could not be upgraded: {error}"
+                        );
+                    } else if let Err(error) = AiRoom::set_instruction_version(
+                        &deployment.db().pool,
+                        room.id,
+                        INSTRUCTION_VERSION,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            room_id = %room.id,
+                            "AI Room instruction version could not be recorded: {error}"
                         );
                     }
                 }
@@ -598,38 +984,72 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
                 }
             };
 
+            // A local root can be temporarily unavailable at app startup
+            // (detached drive, network folder, permission prompt). Keep
+            // retrying old registered rooms until the generated v16 files and
+            // managed AGENTS/CLAUDE blocks are actually installed.
+            for room in rooms
+                .iter()
+                .filter(|room| room.instruction_version < INSTRUCTION_VERSION)
+            {
+                let _guard = SYNC_LOCK.lock().await;
+                match initialize_local(room).await {
+                    Ok(()) => {
+                        if let Err(error) = AiRoom::set_instruction_version(
+                            &deployment.db().pool,
+                            room.id,
+                            INSTRUCTION_VERSION,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                room_id = %room.id,
+                                "AI Room automatic instruction upgrade could not be recorded: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            room_id = %room.id,
+                            "AI Room automatic local instruction upgrade will retry: {error}"
+                        );
+                    }
+                }
+            }
+
             for room in rooms
                 .into_iter()
                 .filter(|room| room.ssh_alias.is_some() && room.remote_root.is_some())
             {
-                let remote = read_remote_files(&room).await;
-                if !remote.available {
-                    continue;
+                // Runs before the availability gate so activity on a server
+                // whose temporary room was already cleaned up (or never
+                // prepared) is still observed, and detached so a slow remote
+                // scan cannot delay the other rooms' synchronization.
+                {
+                    let room = room.clone();
+                    tokio::spawn(async move { refresh_remote_activity(&room).await });
                 }
 
-                let _guard = SYNC_LOCK.lock().await;
-                if all_remote_sessions_complete(&remote.files) {
-                    match sync_room_internal(&deployment, room).await {
-                        Ok(result) if result.conflicts.is_empty() => {
-                            tracing::info!(
-                                copied = result.copied_to_local.len(),
-                                removed = result.removed_from_remote.len(),
-                                "AI Room automatically synchronized and cleaned the server"
-                            );
-                        }
-                        Ok(result) => {
-                            tracing::warn!(
-                                conflicts = result.conflicts.len(),
-                                "AI Room automatic sync preserved conflicting server records"
-                            );
-                        }
-                        Err(error) => {
-                            tracing::warn!("AI Room automatic sync failed: {error}");
+                let remote = read_remote_files(&room).await;
+                if !remote.available {
+                    if remote.error.as_deref() == Some(SERVER_NOT_PREPARED_ERROR)
+                        && let (Some(alias), Some(root)) = (&room.ssh_alias, &room.remote_root)
+                    {
+                        match prepare_remote(&room, alias, root).await {
+                            Ok(()) => tracing::info!(
+                                room_id = %room.id,
+                                "AI Room automatically prepared missing server instructions"
+                            ),
+                            Err(error) => tracing::warn!(
+                                room_id = %room.id,
+                                "AI Room automatic server preparation will retry: {error}"
+                            ),
                         }
                     }
                     continue;
                 }
 
+                let _guard = SYNC_LOCK.lock().await;
                 let mut local = read_local_files(&room).await;
                 match sync_remote_checkpoints(&room, &mut local, &remote).await {
                     Ok((copied, conflicts)) => {
@@ -638,7 +1058,7 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
                                 &room,
                                 alias,
                                 root,
-                                remote.files.get("ROOM.md").map(String::as_str),
+                                &remote.files,
                             )
                             .await
                         {
@@ -652,6 +1072,14 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
                                 conflicts = conflicts.len(),
                                 "AI Room mirrored active server checkpoints without cleanup"
                             );
+                            // Keep the room list ordered by real activity now
+                            // that no automatic path calls sync_room_internal.
+                            if let Err(error) = AiRoom::touch(&deployment.db().pool, room.id).await
+                            {
+                                tracing::warn!(
+                                    "AI Room could not refresh the room timestamp: {error}"
+                                );
+                            }
                         }
                     }
                     Err(error) => {
@@ -670,6 +1098,9 @@ pub async fn delete_room(
     if !AiRoom::delete(&deployment.db().pool, room_id).await? {
         return Err(ApiError::BadRequest("Room not found".into()));
     }
+    REMOTE_ACTIVITY.lock().await.remove(&room_id);
+    LOCAL_ACTIVITY.lock().await.remove(&room_id);
+    SUMMARY_BACKOFF.lock().await.remove(&room_id);
     Ok(ResponseJson(ApiResponse::success(())))
 }
 
@@ -702,10 +1133,15 @@ fn normalized_local_path(path: &FsPath) -> String {
 
 fn room_instruction(room: &AiRoom) -> String {
     let instruction = format!(
-        "# AI Room: {name}\n\nRoom ID: `{id}`\nInstruction version: {version}\n\n## Required session workflow\n\n1. Before doing any work, read `.ai-room/context.md`, `.ai-room/decisions.md`, `.ai-room/tasks.md`, every relevant file in `.ai-room/library/`, every additional Markdown instruction directly under `.ai-room/`, and the newest files in `.ai-room/sessions/`.\n2. Create one new session file named `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<short-id>.md`. Never reuse another session's filename.\n3. Record the goal, assumptions, important commands, files changed, verification results, candidate decisions, blockers, and concrete next steps. Write the first checkpoint immediately. Update it after every meaningful work unit and never allow more than 10 minutes of active work without a checkpoint. A chat may remain open for months; checkpoints are work-state records, not chat endings. If the user pauses, stops, or cancels work while you can still write, immediately record the status as Stopped or Cancelled.\n4. When the user asks you to remember a reusable method, rule, convention, checklist, prompt, or operating procedure, create or update one focused Markdown file in `.ai-room/library/`. Use a descriptive filename ending in `.md`, keep one topic per file, and make it understandable without chat history. Do not use the library for transient session notes.\n5. Do not edit `tasks.md` or `decisions.md`. Task AI Platform reads stable session checkpoints together and locally rebuilds both documents. State results, approval status, next actions, blockers, and whether a candidate decision was actually approved explicitly in the session file.\n6. Treat `context.md` as owner-authored project context. Read it but do not edit it unless the user explicitly asks you to change that document.\n7. Never store secrets, tokens, private keys, raw credentials, personal data, or generated binaries in room files.\n8. Before ending the entire work record, make the session file sufficient for another Claude or Codex session to continue without relying on chat history. After all other writes are finished, add `{complete_marker}` as the final line. The completion marker is only for safe server cleanup; local task and decision updates use stable intermediate checkpoints after two quiet minutes.\n\n## Server privacy\n\nWhile work is active, Task AI Platform copies changing server session checkpoints to local storage without deleting the server files. Once every remote session is complete and the merge is conflict-free, it removes the temporary server room. Task and decision summarization uses only the local Ollama service; session contents are not sent to a cloud model.\n\n## Room endpoints\n\n- Local root: `{local}`\n- Remote root: `{remote}`\n\nThe Task AI Platform manages and synchronizes these records. Claude and Codex perform the project work directly in the selected root.\n",
+        "# AI Room: {name}\n\nRoom ID: `{id}`\nInstruction version: {version}{description}\n\n## Required session workflow\n\n1. Before doing any work, locate the nearest `.ai-room/ROOM.md` by checking the current working directory and then each parent directory. The directory containing that `.ai-room` is the room root. This rule still applies when the AI starts inside a nested module or subfolder. If no ancestor contains it, there is no room for this checkout.\n2. From the room root, read `sessions/INDEX.md` first when it exists, then `.ai-room/context.md`, `.ai-room/decisions.md`, `.ai-room/tasks.md`, relevant files in `.ai-room/library/`, additional Markdown instructions directly under `.ai-room/`, and the newest session records. Read active (`진행중`) rows before choosing files to edit. Resolve every room path from the room root, not from the current subfolder.\n3. Give this chat window one unique `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<conversation-id>/` directory. Never use another chat's directory. Create `000001-start.md` inside it before project work, using this header shape: `# Session: one-line title`, `- Agent: agent name`, `- Module: affected module or area`, `- Status: 진행중`, and `- Started: YYYY-MM-DD HH:MM (timezone)`.\n4. Treat every checkpoint file as immutable. Before each user-facing final response and at meaningful transitions, create the next zero-padded file such as `000002-checkpoint.md`; never edit, replace, rename, or delete an earlier checkpoint. Each new file must repeat the header and preserve the new Goal/checkpoint evidence, decisions with approval state, blockers, changed files, verification, and ordered next steps needed for handoff.\n5. While a user-requested task is still running, send a user-visible progress report when work starts and at least once every 5 minutes of wall-clock time until the final response. A session-file checkpoint does not count as a user report. Each report must state what finished, what is running now, any blocker, and what will happen next. Do not repeat a generic waiting message. Split long-running commands or waits where possible so the reporting interval is not missed; if one operation cannot be interrupted for 5 minutes, warn the user before starting it and report immediately when it returns.\n6. Before editing a file, inspect active sessions for overlapping ownership. Do not edit files claimed by another active AI; create your own conversation directory, link the preceding session when continuing its work, and ask the user to coordinate overlaps. If the user pauses or cancels work, create one final checkpoint with `Status: 중단` or `Status: 보류` and record why.\n7. When the user asks you to remember a reusable method, rule, convention, checklist, prompt, or operating procedure, create or update one focused Markdown file in the room root's `.ai-room/library/`. Use a descriptive filename ending in `.md`, keep one topic per file, and make it understandable without chat history. Do not use the library for transient session notes.\n8. Do not edit `tasks.md` or `decisions.md`. Task AI Platform reads stable session checkpoints together and locally rebuilds both documents. Treat `context.md` as owner-authored and edit it only when explicitly asked.\n9. Never store secrets, tokens, private keys, raw credentials, personal data, or generated binaries in room files.\n10. Before the final response, create the next checkpoint so another AI can continue without chat history. Set its `Status` to exactly one of `완료`, `중단`, or `보류`. If `sessions/INDEX.md` documents a local regeneration command, run it before writing that final checkpoint. Add `{complete_marker}` as the final line of the final checkpoint only. Never go back to mark an earlier file complete.\n\n## Server privacy\n\nWhile work is active, Task AI Platform copies changing server session checkpoints to local storage without deleting the server files. Once every remote session is complete and the merge is conflict-free, it removes the temporary server room. Task and decision summarization uses only the local Ollama service; session contents are not sent to a cloud model.\n\n## Room endpoints\n\n- Local root: `{local}`\n- Remote root: `{remote}`\n\nThe Task AI Platform manages and synchronizes these records. Claude and Codex perform the project work directly in the selected root.\n",
         name = room.name,
         id = room.id,
         version = INSTRUCTION_VERSION,
+        description = room
+            .description
+            .as_deref()
+            .map(|value| format!("\nDescription: {value}"))
+            .unwrap_or_default(),
         complete_marker = SESSION_COMPLETE_MARKER,
         local = room.local_root,
         remote = room
@@ -715,15 +1151,59 @@ fn room_instruction(room: &AiRoom) -> String {
             .map(|(alias, root)| format!("{alias}:{root}"))
             .unwrap_or_else(|| "not configured".into()),
     );
+    let instruction = instruction
+        .replace("<conversation-id>", "<random-id>")
+        .replace(
+            "Never use another chat's directory.",
+            "Generate at least 8 random hexadecimal characters for `<random-id>` and, if that directory already exists, generate another. Never use another chat's directory.",
+        )
+        .replace(
+            "Split long-running commands or waits where possible so the reporting interval is not missed; if one operation cannot be interrupted for 5 minutes, warn the user before starting it and report immediately when it returns.",
+            "Never start a foreground tool call, command, or wait that can block reporting for 4 minutes or longer. Start long work asynchronously or in the background and poll it at intervals of at most 60 seconds so user reports remain possible. If an operation truly cannot be interrupted, warn the user before it starts and report immediately when it returns.",
+        )
+        .replace(
+            "then `.ai-room/context.md`",
+            "then `.ai-room/library/owner-working-rules.md`, `.ai-room/context.md`",
+        )
+        .replace(
+            "While work is active, Task AI Platform copies changing server session checkpoints to local storage without deleting the server files. Once every remote session is complete and the merge is conflict-free, it removes the temporary server room.",
+            "Server room records are persistent: Task AI Platform never deletes them automatically, and it continuously copies changing server session checkpoints to local storage.",
+        )
+        .replace(
+            "If `sessions/INDEX.md` documents a local regeneration command, run it before writing that final checkpoint. Add `<!-- task-ai-room:complete -->` as the final line of the final checkpoint only. Never go back to mark an earlier file complete.",
+            "Add `<!-- task-ai-room:complete -->` as that new file's final line. Never go back to mark an earlier file complete. Then regenerate `sessions/INDEX.md` when its documented command exists without modifying the checkpoint.",
+        )
+        .replace("## Server privacy", "## Server retention and privacy");
     format!(
-        "{instruction}\n## Record language\n\n- Session checkpoint files may use whichever language lets the active AI preserve technical meaning and handoff context most accurately; they do not need to be Korean.\n- `decisions.md` is shared by the owner and every AI. Task AI Platform renders its explanatory text in Korean and translates session content when necessary. Keep code identifiers, file paths, and product names unchanged when translation would damage their meaning.\n"
+        "{instruction}\n## Mandatory adversarial code review\n\nAfter changing code or executable configuration, read `.ai-room/library/{ADVERSARIAL_REVIEW_NAME}` and apply it before claiming completion. Use two independent critics with different roles and preferably different model families. Let tests, compiler output, static analysis, and reproducible traces outrank model consensus. Record the critics, findings, adjudication evidence, rerun verification, and unresolved risk in the session. This does not apply to answer-only, research-only, planning-only, or prose-only work.\n\n## Record language\n\n- Session checkpoint files may use whichever language lets the active AI preserve technical meaning and handoff context most accurately; they do not need to be Korean.\n- `decisions.md` is shared by the owner and every AI. Task AI Platform renders its explanatory text in Korean and translates session content when necessary. Keep code identifiers, file paths, and product names unchanged when translation would damage their meaning.\n"
     )
 }
 
 fn managed_agent_block(room: &AiRoom) -> String {
     let _ = room;
     format!(
-        "{START_MARKER}\n## Shared AI Room\n\nIf this checkout has a local `.ai-room/ROOM.md`, read it before every task and follow its session recording workflow. AI Room records are private local runtime data and must never be committed to Git.\n{END_MARKER}"
+        "{START_MARKER}\n## Shared AI Room — mandatory\n\nBefore analysis or the first project tool call, search from the current working directory upward for the nearest `.ai-room/ROOM.md`. A room located in a parent project root still applies inside a nested module. If found, its workflow is required, not optional documentation.\n\nUse the directory containing `.ai-room` as the room root:\n1. Read `.ai-room/sessions/INDEX.md` first when present, then `ROOM.md` and the room files it requires. Check active (`진행중`) sessions before choosing files to edit.\n2. Give this chat its own unique `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<conversation-id>/` directory. Never use another chat's directory.\n3. Before project work, create `000001-start.md` there with this exact header shape: `# Session: title`, `- Agent: name`, `- Module: area`, `- Status: 진행중`, `- Started: YYYY-MM-DD HH:MM (timezone)`.\n\nDuring work:\n- Before every user-facing final response and at meaningful transitions, add the next zero-padded Markdown checkpoint. Never rewrite, rename, or delete an existing checkpoint.\n- Send the user a visible progress report when work starts and at least every 5 minutes until completion. Session-file writes do not count. State what finished, what is running, blockers, and what comes next; do not repeat generic waiting text. Warn before an uninterruptible operation that may exceed 5 minutes and report immediately afterward.\n- Repeat the discoverable header in every checkpoint and record Goal, checkpoint evidence, decisions and approval state, blockers, failed approaches, changed files, verification, and ordered next steps.\n- Do not edit files claimed by another active session without user coordination.\n- Never edit `.ai-room/tasks.md` or `.ai-room/decisions.md`; Task AI Platform derives them.\n\nBefore the final response, create one final checkpoint with `Status: 완료`, `중단`, or `보류`, regenerate `sessions/INDEX.md` first when its documented command exists, and put the completion marker required by `ROOM.md` on that new file's final line. AI Room records are private runtime data and must never be committed to Git.\n{END_MARKER}"
+    )
+    .replace("<conversation-id>", "<random-id>")
+    .replace(
+        "Never use another chat's directory.",
+        "Generate at least 8 random hexadecimal characters for `<random-id>` and, if that directory already exists, generate another. Never use another chat's directory.",
+    )
+    .replace(
+        "Warn before an uninterruptible operation that may exceed 5 minutes and report immediately afterward.",
+        "Never use one foreground tool call or wait that can block reporting for 4 minutes or longer; run long work asynchronously and poll at most every 60 seconds. Warn before a truly uninterruptible operation and report immediately afterward.",
+    )
+    .replace(
+        "then `ROOM.md` and the room files it requires",
+        "then `ROOM.md`, `.ai-room/library/owner-working-rules.md`, and the room files they require",
+    )
+    .replace(
+        "regenerate `sessions/INDEX.md` first when its documented command exists, and put the completion marker required by `ROOM.md` on that new file's final line.",
+        "put the completion marker required by `ROOM.md` on that new file's final line. Then regenerate `sessions/INDEX.md` when its documented command exists without modifying the checkpoint.",
+    )
+    .replace(
+        "- Never edit `.ai-room/tasks.md` or `.ai-room/decisions.md`; Task AI Platform derives them.\n\nBefore the final response",
+        &format!("- Never edit `.ai-room/tasks.md` or `.ai-room/decisions.md`; Task AI Platform derives them.\n- After code or executable-configuration changes, read `.ai-room/library/{ADVERSARIAL_REVIEW_NAME}` and complete its two-independent-critic, evidence-driven review before claiming completion.\n\nBefore the final response"),
     )
 }
 
@@ -733,6 +1213,14 @@ fn upsert_managed_block(existing: &str, block: &str) -> String {
     {
         let end = end_start + END_MARKER.len();
         return format!("{}{}{}", &existing[..start], block, &existing[end..]);
+    }
+    if let Some(start) = existing.find(START_MARKER) {
+        let preserved = existing.replacen(START_MARKER, "", 1);
+        return format!("{}\n\n{block}\n", preserved.trim());
+    }
+    if existing.contains(END_MARKER) {
+        let preserved = existing.replacen(END_MARKER, "", 1);
+        return format!("{}\n\n{block}\n", preserved.trim());
     }
     if existing.trim().is_empty() {
         format!("{block}\n")
@@ -774,6 +1262,11 @@ fn initial_files(room: &AiRoom) -> Vec<(String, String)> {
             serde_json::to_string_pretty(&manifest).unwrap(),
         ),
         ("ROOM.md".into(), room_instruction(room)),
+        (OWNER_RULES_FILE.into(), owner_working_rules(&[])),
+        (
+            ADVERSARIAL_REVIEW_FILE.into(),
+            adversarial_code_review_protocol().into(),
+        ),
         (
             "context.md".into(),
             format!(
@@ -795,15 +1288,150 @@ fn initial_files(room: &AiRoom) -> Vec<(String, String)> {
     ]
 }
 
-fn all_remote_sessions_complete(files: &BTreeMap<String, String>) -> bool {
-    let sessions = files
-        .iter()
-        .filter(|(name, _)| name.starts_with("sessions/"))
+fn owner_working_rules(additional_documents: &[String]) -> String {
+    let mut content = String::from(
+        "# 프로젝트 소유자의 AI 작업 규칙\n\n이 문서는 사용자가 여러 작업에서 반복해 요구한 방식을 통합한 필수 규칙이다. 모든 AI는 작업을 시작하기 전에 읽고, 프로젝트별 세부 규칙 문서도 함께 따른다.\n\n## 공통 작업 방식\n\n- 사용자의 지시 범위를 임의로 줄이거나 늘리거나 다른 방식으로 대체하지 않는다. 더 나은 방법이나 부수효과가 보이면 코드에 몰래 반영하지 말고 먼저 말한다.\n- 사용자가 만든 설계 문서와 기존 구조를 사양으로 취급한다. 코드를 쓰기 전에 관련 마스터 문서, AI Room 문서, 유사 코드를 읽는다. 구조 변경은 사전에 알리고 승인을 받는다.\n- 사용자가 질문·의견·현실성 검토만 요청한 경우 명시적인 구현 지시 전에는 코딩·설치·실행을 시작하지 않는다.\n- 기본 구현은 장기적으로 유지 가능한 방식을 택한다. 임시방편은 사용자가 명시적으로 요청할 때만 사용한다.\n- 살아 있는 작업 데이터로 테스트하지 않는다. 격리된 사본이나 임시 데이터를 사용하며, 소유하지 않은 세션의 데이터 이동·삭제를 하지 않는다.\n- 커밋·푸시·브랜치 변경 같은 Git 외부 반영은 사용자가 명시적으로 요청한 범위에서만 수행한다. 이미 범위가 명확한 지시를 다시 의심해 시간을 쓰지 않는다.\n- 잘못했을 때 감정적인 사과를 반복하지 말고 원인, 수정 결과, 재발 방지 규칙을 짧게 남긴다.\n- 사용자에게 답변할 때는 항상 존댓말을 사용한다. 사용자가 반말을 쓰더라도 이를 따라 반말로 전환하지 않는다.\n- 사용자를 부를 필요가 있으면 `호명님` 또는 `Homaung`을 사용하고 추측성 호칭을 쓰지 않는다.\n- 사용자는 적녹 색약이므로 빨강과 초록만으로 의미를 구분하지 않는다. 파랑·마젠타·노랑과 모양·문자를 함께 사용한다.\n\n## 코드 변경의 3권 분립 검토\n\n- 코드나 실행 결과에 영향을 주는 설정을 변경하면 완료 응답 전에 [`adversarial-code-review-protocol.md`](adversarial-code-review-protocol.md)를 반드시 적용한다.\n- 메인 구현자와 독립된 기술 감사관·요구사항 감사관이 먼저 서로의 결론을 보지 않고 검토한다.\n- 가능하면 저비용 Codex 계열과 저비용 Claude 계열을 교차 사용한다. 사용할 수 없으면 격리된 두 검토 역할로 대체하고 그 한계를 공개한다.\n- 검토자 간 토론은 충돌한 지적에 대해 한 번만 허용하며, 다수결이나 말의 설득력보다 테스트·컴파일·정적 분석·재현 결과를 우선한다.\n- 확인된 blocker·high·medium 지적을 처리하고 검증을 다시 실행하기 전에는 작업을 완료로 표시하지 않는다.\n\n## 진행 보고와 세션 기록은 별개\n\n- 진행 중에는 사용자 대화에 최대 5분마다 중간 보고한다. 이것은 세션 Markdown 기록 주기가 아니다.\n- 작업 시작 시 대화창마다 고유한 `sessions/YYYYMMDD-HHMMSS-agent-conversation-id/` 폴더를 만들고 첫 체크포인트 파일을 적는다. 다른 대화창의 폴더를 공유하지 않는다.\n- 하나의 사용자 대화/AI 응답 단위가 끝나기 전에 같은 폴더에 다음 순번 Markdown 파일을 새로 추가한다. 기존 파일은 수정·교체·이름 변경·삭제하지 않는다.\n- 세션 파일을 5분마다 기계적으로 만들지 않는다. 사용자에게 보이는 5분 보고와 영속 세션 기록을 서로 대체하지 않는다.\n- 다른 AI의 진행 중 세션과 소유 파일을 먼저 확인하며, 남의 세션 폴더나 파일을 수정하지 않는다.\n\n## 프로젝트별 추가 필수 문서\n\n",
+    );
+    content = content.replace(
+        "- 작업 시작 시 대화창마다 고유한 `sessions/YYYYMMDD-HHMMSS-agent-conversation-id/` 폴더를 만들고 첫 체크포인트 파일을 적는다. 다른 대화창의 폴더를 공유하지 않는다.",
+        "- 작업 시작 시 대화창마다 고유한 `sessions/YYYYMMDD-HHMMSS-agent-random-id/` 폴더를 만들고 첫 체크포인트 파일을 적는다. `random-id`는 임의의 16진수 8자 이상이며 이미 존재하는 폴더명은 다시 쓰지 않는다. 다른 대화창의 폴더를 공유하지 않는다.",
+    );
+    if additional_documents.is_empty() {
+        content.push_str("- 현재 발견된 추가 규칙 문서가 없습니다.\n");
+    } else {
+        for document in additional_documents {
+            content.push_str(&format!("- [`{document}`]({document})\n"));
+        }
+    }
+    content
+}
+
+fn adversarial_code_review_protocol() -> &'static str {
+    "# 3권 분립형 적대 코드 검토 규약\n\n코드나 실행 결과에 영향을 주는 설정을 변경한 작업은 완료 응답 전에 이 규약을 적용한다. 단순 질문, 조사, 기획, 실행에 영향을 주지 않는 문서 수정에는 적용하지 않는다.\n\n## 역할\n\n- **구현자:** 사용자 요구를 구현하고 기본 테스트를 수행한다.\n- **기술 감사관:** 가능하면 저비용 Codex 계열의 독립 에이전트를 사용한다. 정확성, 회귀, API·타입 계약, 동시성, 성능, 마이그레이션과 누락된 테스트를 검토한다.\n- **요구사항 감사관:** 가능하면 저비용 Claude 계열의 독립 에이전트를 사용한다. 사용자 의도 누락, 보안, 개인정보, 권한, 운영 실패, 위험한 기본값과 오해를 부르는 UI를 검토한다.\n\n서로 다른 계열을 함께 사용할 수 없으면 격리된 새 에이전트 두 개를 서로 다른 역할로 사용한다. 서브에이전트를 사용할 수 없으면 같은 AI가 문맥을 분리한 두 번의 검토를 수행하고 그 한계를 공개한다.\n\n## 필수 절차\n\n1. 구현자는 두 감사관에게 동일한 최소 증거 묶음을 제공한다. 사용자 요구, 제약, 변경 diff, 관련 주변 코드, 적용되는 규칙, 이미 실행한 검증 결과와 알려진 한계를 포함한다.\n2. 두 감사관은 첫 검토에서 서로의 결과와 구현자의 결론을 보지 않는다. 검토 중 실제 프로젝트 파일을 수정하지 않는다.\n3. 모든 지적은 심각도, 정확한 파일·좁은 줄 범위, 실패 시나리오, 재현 방법 또는 판별 테스트, 최소 수정안을 포함해야 한다.\n4. 두 결과가 충돌하거나 겹칠 때만 서로의 지적과 증거를 보여주고 각각 한 번만 반박하게 한다. 무제한 토론과 다수결은 금지한다.\n5. 판정 우선순위는 재현 테스트, 런타임 추적, 컴파일·타입 검사·정적 분석, 사용자 요구·프로젝트 규칙, 공식 계약, 모델 주장 순서다.\n6. 확인된 blocker·high·medium 지적을 수정하고 관련 검증을 다시 실행한다. 남은 위험을 조용히 무시하지 않는다.\n7. 고위험 변경에서 해결되지 않은 충돌은 강한 독립 판정자나 사용자에게 승격한다.\n\n## 완료 조건\n\n세션 기록과 사용자 완료 보고에 감사관 또는 대체 방식, 위험 등급, 확인·기각·수정·수용한 지적, 판정 증거, 수정 후 검증, 해결되지 않은 위험과 승격 상태를 남긴다. 이 항목이 없으면 코드 변경 작업을 완료로 표시하지 않는다.\n"
+}
+
+fn is_session_record_name(name: &str) -> bool {
+    name.ends_with(".md") && !name.eq_ignore_ascii_case(SESSION_INDEX_FILE)
+}
+
+fn is_session_component(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 160
+        && name
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.'))
+        && name != "."
+        && name != ".."
+}
+
+fn is_session_record_path(path: &str) -> bool {
+    let Some(relative) = path.strip_prefix("sessions/") else {
+        return false;
+    };
+    let parts = relative.split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [filename] => is_session_component(filename) && is_session_record_name(filename),
+        [conversation, filename] => {
+            is_session_component(conversation)
+                && !is_session_record_name(conversation)
+                && is_session_component(filename)
+                && is_session_record_name(filename)
+        }
+        _ => false,
+    }
+}
+
+fn session_conversation_key(path: &str) -> Option<String> {
+    let relative = path.strip_prefix("sessions/")?;
+    let mut parts = relative.split('/');
+    let first = parts.next()?;
+    match (parts.next(), parts.next()) {
+        (None, None) if is_session_record_path(path) => Some(path.to_string()),
+        (Some(_), None) if is_session_record_path(path) => Some(format!("sessions/{first}")),
+        _ => None,
+    }
+}
+
+fn is_session_conversation_path(path: &str) -> bool {
+    let Some(relative) = path.strip_prefix("sessions/") else {
+        return false;
+    };
+    !relative.contains('/')
+        && is_session_component(relative)
+        && !is_session_record_name(relative)
+}
+
+fn aggregate_session_records(
+    local: &BTreeMap<String, String>,
+    remote: &BTreeMap<String, String>,
+) -> (Vec<AiRoomRecord>, Vec<String>) {
+    let mut groups = BTreeMap::<String, Vec<(String, String, String)>>::new();
+    let mut conflicts = Vec::new();
+    let mut names = local
+        .keys()
+        .chain(remote.keys())
+        .filter(|name| is_session_record_path(name))
+        .cloned()
         .collect::<Vec<_>>();
-    !sessions.is_empty()
-        && sessions
-            .iter()
-            .all(|(_, content)| session_is_complete(content))
+    names.sort();
+    names.dedup();
+
+    for filename in names {
+        let Some(conversation) = session_conversation_key(&filename) else {
+            continue;
+        };
+        let (content, source) = match (local.get(&filename), remote.get(&filename)) {
+            (Some(left), Some(right)) if left == right => (left.clone(), "both".to_string()),
+            (Some(left), Some(_)) => {
+                conflicts.push(filename.clone());
+                (left.clone(), "conflict".to_string())
+            }
+            (Some(content), None) => (content.clone(), "local".to_string()),
+            (None, Some(content)) => (content.clone(), "remote".to_string()),
+            _ => continue,
+        };
+        groups
+            .entry(conversation)
+            .or_default()
+            .push((filename, content, source));
+    }
+
+    let mut records = groups
+        .into_iter()
+        .map(|(filename, mut checkpoints)| {
+            checkpoints.sort_by(|left, right| left.0.cmp(&right.0));
+            let source = if checkpoints.iter().all(|entry| entry.2 == "both") {
+                "both"
+            } else if checkpoints.iter().all(|entry| entry.2 == "local") {
+                "local"
+            } else if checkpoints.iter().all(|entry| entry.2 == "remote") {
+                "remote"
+            } else if checkpoints.iter().all(|entry| entry.2 == "conflict") {
+                "conflict"
+            } else {
+                "mixed"
+            };
+            let content = if checkpoints.len() == 1 && checkpoints[0].0 == filename {
+                checkpoints.remove(0).1
+            } else {
+                checkpoints
+                    .into_iter()
+                    .map(|(checkpoint, content, _)| {
+                        let name = checkpoint.rsplit('/').next().unwrap_or(&checkpoint);
+                        format!("<!-- AI Room checkpoint: {name} -->\n\n{content}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n---\n\n")
+            };
+            AiRoomRecord {
+                filename,
+                content,
+                source: source.into(),
+            }
+        })
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| right.filename.cmp(&left.filename));
+    (records, conflicts)
 }
 
 fn session_is_complete(content: &str) -> bool {
@@ -811,6 +1439,259 @@ fn session_is_complete(content: &str) -> bool {
         .lines()
         .next_back()
         .is_some_and(|line| line.trim() == SESSION_COMPLETE_MARKER)
+}
+
+/// Newest file modification time under `root`, skipping room records, version
+/// control, and generated directories. Bounded by entry count and depth so the
+/// scan stays cheap on large project roots.
+fn latest_workspace_activity(root: &FsPath) -> Option<SystemTime> {
+    let mut newest: Option<SystemTime> = None;
+    let mut visited = 0usize;
+    // Breadth-first order spreads the entry budget across sibling directories
+    // instead of letting one huge subtree consume it all.
+    let mut stack = std::collections::VecDeque::from([(root.to_path_buf(), 0usize)]);
+    while let Some((dir, depth)) = stack.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > ACTIVITY_SCAN_MAX_ENTRIES {
+                return newest;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if depth < ACTIVITY_SCAN_MAX_DEPTH
+                    && !ACTIVITY_EXCLUDED_DIRS.contains(&name.as_str())
+                {
+                    stack.push_back((entry.path(), depth + 1));
+                }
+            } else if file_type.is_file() {
+                // The app itself rewrites the managed root instruction files
+                // (AGENTS.md/CLAUDE.md) on startup and upgrades; counting them
+                // would raise a self-inflicted activity warning.
+                if depth == 0 {
+                    let name = entry.file_name();
+                    if name == "AGENTS.md" || name == "CLAUDE.md" {
+                        continue;
+                    }
+                }
+                if let Ok(metadata) = entry.metadata()
+                    && let Ok(modified) = metadata.modified()
+                    && newest.is_none_or(|current| modified > current)
+                {
+                    newest = Some(modified);
+                }
+            }
+        }
+    }
+    newest
+}
+
+/// Work is "unrecorded" when the workspace changed recently but no session
+/// record (active or completed) was updated within the checkpoint deadline.
+fn is_unrecorded_activity(
+    activity_age: Option<Duration>,
+    latest_record_age: Option<Duration>,
+) -> bool {
+    activity_age.is_some_and(|age| age <= ACTIVITY_RECENT_WINDOW)
+        && latest_record_age.is_none_or(|age| age >= CHECKPOINT_OVERDUE_AFTER)
+}
+
+/// Refresh the cached newest remote workspace modification time for a room.
+/// Piggybacks on the auto-sync loop and throttles the extra `find` to once per
+/// `REMOTE_ACTIVITY_CHECK_INTERVAL`. Failures are cached as "no activity" so an
+/// unreachable server does not retry every cycle or raise false warnings.
+async fn refresh_remote_activity(room: &AiRoom) {
+    let (Some(alias), Some(root)) = (&room.ssh_alias, &room.remote_root) else {
+        return;
+    };
+    let now = SystemTime::now();
+    // Reserve the slot before the SSH call so concurrent refreshes for the
+    // same room cannot start a duplicate remote scan.
+    let previous = {
+        let mut cache = REMOTE_ACTIVITY.lock().await;
+        let entry = cache.get(&room.id).copied();
+        if let Some((checked, _)) = entry
+            && now
+                .duration_since(checked)
+                .is_ok_and(|age| age < REMOTE_ACTIVITY_CHECK_INTERVAL)
+        {
+            return;
+        }
+        let previous = entry.and_then(|(_, latest)| latest);
+        cache.insert(room.id, (now, previous));
+        previous
+    };
+    let prunes = ACTIVITY_EXCLUDED_DIRS
+        .iter()
+        .map(|name| format!("-name {}", posix_quote(name)))
+        .collect::<Vec<_>>()
+        .join(" -o ");
+    let script = format!(
+        "root={root}; cd \"$root\" 2>/dev/null || exit 2; \
+find . -maxdepth {depth} \\( {prunes} \\) -prune -o -type f -mmin -{window} -not -path ./AGENTS.md -not -path ./CLAUDE.md -printf '%T@\\n' 2>/dev/null | sort -rn | head -n 1",
+        root = posix_quote(root),
+        depth = ACTIVITY_SCAN_MAX_DEPTH,
+        window = ACTIVITY_RECENT_WINDOW.as_secs() / 60,
+    );
+    // A successful command with empty output means "no recent activity"; a
+    // failed command keeps the last known value instead of erasing it.
+    let latest = match run_remote(alias, &script).await {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|epoch| *epoch > 0.0)
+            .map(|epoch| SystemTime::UNIX_EPOCH + Duration::from_secs_f64(epoch)),
+        _ => previous,
+    };
+    REMOTE_ACTIVITY
+        .lock()
+        .await
+        .insert(room.id, (SystemTime::now(), latest));
+}
+
+/// Cached wrapper around the local workspace scan so 15-second snapshot
+/// polling does not rescan the tree on every request.
+async fn cached_local_activity(room: &AiRoom) -> Option<SystemTime> {
+    let now = SystemTime::now();
+    {
+        let cache = LOCAL_ACTIVITY.lock().await;
+        if let Some((checked, latest)) = cache.get(&room.id)
+            && now
+                .duration_since(*checked)
+                .is_ok_and(|age| age < LOCAL_ACTIVITY_CHECK_INTERVAL)
+        {
+            return *latest;
+        }
+    }
+    let root = PathBuf::from(&room.local_root);
+    let latest = tokio::task::spawn_blocking(move || latest_workspace_activity(&root))
+        .await
+        .ok()
+        .flatten();
+    LOCAL_ACTIVITY
+        .lock()
+        .await
+        .insert(room.id, (SystemTime::now(), latest));
+    latest
+}
+
+async fn session_record_modified(room: &AiRoom, session: &str) -> Option<SystemTime> {
+    let path = PathBuf::from(&room.local_root)
+        .join(ROOM_DIR)
+        .join(session);
+    if is_session_record_path(session) {
+        return fs::metadata(path)
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+    }
+    if !is_session_conversation_path(session) {
+        return None;
+    }
+    let mut newest = None;
+    let mut entries = fs::read_dir(path).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let relative = format!("{session}/{name}");
+        if !is_session_record_path(&relative) {
+            continue;
+        }
+        if let Ok(metadata) = entry.metadata().await
+            && let Ok(modified) = metadata.modified()
+            && newest.is_none_or(|current| modified > current)
+        {
+            newest = Some(modified);
+        }
+    }
+    newest
+}
+
+async fn checkpoint_health(
+    room: &AiRoom,
+    sessions: &[AiRoomRecord],
+    overrides: &BTreeMap<String, String>,
+) -> AiRoomCheckpointHealth {
+    let active = sessions
+        .iter()
+        .filter(|session| {
+            !session_is_complete(&session.content)
+                && !session_status(&session.content)
+                    .is_some_and(|status| status_is_inactive(&status))
+                && !overrides
+                    .get(&session.filename)
+                    .is_some_and(|status| status_is_stopped(status))
+        })
+        .collect::<Vec<_>>();
+    let now = SystemTime::now();
+    let mut ages = Vec::new();
+    let mut latest_record_age: Option<Duration> = None;
+    for session in sessions {
+        if let Some(modified) = session_record_modified(room, &session.filename).await
+            && let Ok(age) = now.duration_since(modified)
+        {
+            if latest_record_age.is_none_or(|current| age < current) {
+                latest_record_age = Some(age);
+            }
+            if active
+                .iter()
+                .any(|active| active.filename == session.filename)
+            {
+                ages.push((session.filename.clone(), age));
+            }
+        }
+    }
+    ages.sort_by_key(|(_, age)| *age);
+
+    let local_activity = cached_local_activity(room).await;
+    let remote_activity = REMOTE_ACTIVITY
+        .lock()
+        .await
+        .get(&room.id)
+        .and_then(|(_, activity)| *activity);
+    let local_activity_age = local_activity.and_then(|at| now.duration_since(at).ok());
+    let remote_activity_age = remote_activity.and_then(|at| now.duration_since(at).ok());
+    let newest_activity_age = match (local_activity_age, remote_activity_age) {
+        (Some(local), Some(remote)) => Some(local.min(remote)),
+        (local, remote) => local.or(remote),
+    };
+    let unrecorded_activity = is_unrecorded_activity(newest_activity_age, latest_record_age);
+    let overdue_sessions = ages
+        .iter()
+        .filter(|(_, age)| *age >= CHECKPOINT_OVERDUE_AFTER)
+        .count();
+    let status = if active.is_empty() {
+        "idle"
+    } else if ages.is_empty() {
+        "unknown"
+    } else if ages
+        .first()
+        .is_some_and(|(_, age)| *age >= CHECKPOINT_OVERDUE_AFTER)
+    {
+        "overdue"
+    } else {
+        "healthy"
+    };
+    AiRoomCheckpointHealth {
+        status: status.into(),
+        active_sessions: active.len(),
+        overdue_sessions,
+        latest_session: ages.first().map(|(filename, _)| filename.clone()),
+        latest_checkpoint_age_seconds: ages
+            .first()
+            .map(|(_, age)| age.as_secs().min(u32::MAX as u64) as u32),
+        overdue_after_minutes: (CHECKPOINT_OVERDUE_AFTER.as_secs() / 60) as u32,
+        unrecorded_activity,
+        local_activity_age_seconds: local_activity_age
+            .map(|age| age.as_secs().min(u32::MAX as u64) as u32),
+        remote_activity_age_seconds: remote_activity_age
+            .map(|age| age.as_secs().min(u32::MAX as u64) as u32),
+    }
 }
 
 fn session_is_ready_for_summary(
@@ -824,45 +1705,14 @@ fn session_is_ready_for_summary(
             .is_some_and(|idle| idle >= SESSION_STABLE_AFTER)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum LibraryMergeAction {
-    Same,
-    AcceptRemote,
-    KeepLocal,
-    Conflict,
-}
-
-fn library_merge_action(
-    local: &str,
-    remote: &str,
-    baseline_hash: Option<&str>,
-) -> LibraryMergeAction {
-    if local == remote {
-        return LibraryMergeAction::Same;
-    }
-    match baseline_hash {
-        Some(baseline) if content_hash(local) == baseline => LibraryMergeAction::AcceptRemote,
-        Some(baseline) if content_hash(remote) == baseline => LibraryMergeAction::KeepLocal,
-        _ => LibraryMergeAction::Conflict,
-    }
-}
-
-fn library_baseline(files: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    files
-        .get(LIBRARY_BASELINE_FILE)
-        .and_then(|content| serde_json::from_str(content).ok())
-        .unwrap_or_default()
-}
-
 async fn merge_remote_library_documents(
     room: &AiRoom,
     local_files: &mut BTreeMap<String, String>,
     remote_files: &BTreeMap<String, String>,
 ) -> Result<(Vec<String>, Vec<String>), ApiError> {
-    let baseline = library_baseline(remote_files);
     let remote_documents = remote_library_documents(remote_files);
     let mut copied = Vec::new();
-    let mut conflicts = Vec::new();
+    let conflicts = Vec::new();
 
     for (filename, remote_content) in &remote_documents {
         match local_files.get(filename) {
@@ -871,20 +1721,12 @@ async fn merge_remote_library_documents(
                 local_files.insert(filename.clone(), remote_content.clone());
                 copied.push(filename.clone());
             }
+            Some(local_content) if local_content == remote_content => {}
             Some(local_content) => {
-                match library_merge_action(
-                    local_content,
-                    remote_content,
-                    baseline.get(filename).map(String::as_str),
-                ) {
-                    LibraryMergeAction::Same | LibraryMergeAction::KeepLocal => {}
-                    LibraryMergeAction::AcceptRemote => {
-                        write_local_file(room, &filename, remote_content).await?;
-                        local_files.insert(filename.clone(), remote_content.clone());
-                        copied.push(filename.clone());
-                    }
-                    LibraryMergeAction::Conflict => conflicts.push(filename.clone()),
-                }
+                preserve_local_version(room, filename, local_content).await?;
+                write_local_file(room, filename, remote_content).await?;
+                local_files.insert(filename.clone(), remote_content.clone());
+                copied.push(filename.clone());
             }
         }
     }
@@ -893,8 +1735,7 @@ async fn merge_remote_library_documents(
 }
 
 fn ensure_task_update_section(content: &str) -> String {
-    let dashboard_comment =
-        "<!-- Task AI Platform가 안정된 AI 작업 기록을 바탕으로 이 대시보드를 자동 갱신합니다. -->";
+    let dashboard_comment = "<!-- 로컬 요약(TASK_AI_LOCAL_SUMMARY=1)을 켠 동안에만 Task AI Platform가 이 대시보드를 다시 씁니다. 꺼져 있으면 아래 내용은 마지막 갱신 시점 그대로입니다. -->";
     let normalized = content
         .replace(
             "<!-- The local task summarizer appends one validated line per completed session. -->",
@@ -902,6 +1743,10 @@ fn ensure_task_update_section(content: &str) -> String {
         )
         .replace(
             "<!-- AI agents append exactly one concise line per session below. -->",
+            dashboard_comment,
+        )
+        .replace(
+            "<!-- Task AI Platform가 안정된 AI 작업 기록을 바탕으로 이 대시보드를 자동 갱신합니다. -->",
             dashboard_comment,
         );
     if normalized.contains("## 진행 중") && normalized.contains("## 완료") {
@@ -914,6 +1759,28 @@ fn ensure_task_update_section(content: &str) -> String {
     }
 }
 
+/// The local model dashboard is opt-in. It runs a 4B model on the machine's own
+/// GPU, so it stays off unless the owner asks for it with
+/// `TASK_AI_LOCAL_SUMMARY=1`.
+fn local_summary_enabled() -> bool {
+    env::var(LOCAL_SUMMARY_ENV).is_ok_and(|value| {
+        let value = value.trim();
+        value.eq_ignore_ascii_case("1")
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("on")
+    })
+}
+
+/// Doubles the wait after each consecutive failure so a room that can never
+/// produce a valid dashboard stops occupying the GPU.
+fn summary_retry_delay(failures: u32) -> Duration {
+    let steps = failures.saturating_sub(1).min(16);
+    let seconds = SUMMARY_RETRY_BACKOFF_BASE
+        .as_secs()
+        .saturating_mul(1u64 << steps);
+    Duration::from_secs(seconds.min(SUMMARY_RETRY_BACKOFF_MAX.as_secs()))
+}
+
 async fn summarize_pending_sessions(deployment: &DeploymentImpl) -> Result<(), String> {
     let rooms = AiRoom::find_all(&deployment.db().pool)
         .await
@@ -921,10 +1788,35 @@ async fn summarize_pending_sessions(deployment: &DeploymentImpl) -> Result<(), S
     let mut first_error = None;
 
     for room in rooms {
-        if let Err(error) = summarize_next_session(&room).await
-            && first_error.is_none()
+        let now = SystemTime::now();
+        if let Some((_, next_attempt)) = SUMMARY_BACKOFF.lock().await.get(&room.id).copied()
+            && now < next_attempt
         {
-            first_error = Some(error);
+            continue;
+        }
+
+        match summarize_next_session(&room).await {
+            Ok(()) => {
+                SUMMARY_BACKOFF.lock().await.remove(&room.id);
+            }
+            Err(error) => {
+                let mut backoff = SUMMARY_BACKOFF.lock().await;
+                let failures = backoff
+                    .get(&room.id)
+                    .map_or(1, |(failures, _)| failures.saturating_add(1));
+                let delay = summary_retry_delay(failures);
+                backoff.insert(room.id, (failures, now + delay));
+                drop(backoff);
+                tracing::warn!(
+                    room_id = %room.id,
+                    failures,
+                    retry_in_seconds = delay.as_secs(),
+                    "AI Room dashboard rebuild failed; backing off: {error}"
+                );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
     }
 
@@ -955,27 +1847,12 @@ async fn summarize_next_session(room: &AiRoom) -> Result<(), String> {
     let mut state = read_task_summary_state(&room_dir).await;
     let overrides = read_session_overrides(&room_dir).await;
     let mut sessions = Vec::new();
-    let mut entries = match fs::read_dir(room_dir.join("sessions")).await {
-        Ok(entries) => entries,
-        Err(_) => return Ok(()),
-    };
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(".md") {
-            continue;
-        }
-        if let Ok(content) = fs::read_to_string(entry.path()).await
-            && content.len() <= MAX_DOCUMENT_BYTES
-        {
-            let modified = entry
-                .metadata()
-                .await
-                .ok()
-                .and_then(|metadata| metadata.modified().ok());
-            if session_is_ready_for_summary(&content, modified, SystemTime::now()) {
-                sessions.push((format!("sessions/{name}"), content));
-            }
+    let local = read_local_files(room).await;
+    let (records, _) = aggregate_session_records(&local.files, &BTreeMap::new());
+    for record in records {
+        let modified = session_record_modified(room, &record.filename).await;
+        if session_is_ready_for_summary(&record.content, modified, SystemTime::now()) {
+            sessions.push((record.filename, record.content));
         }
     }
     sessions.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1362,13 +2239,25 @@ fn session_title(content: &str) -> Option<String> {
 }
 
 fn session_status(content: &str) -> Option<String> {
-    let mut lines = content.lines();
-    while let Some(line) = lines.next() {
-        if line.trim().eq_ignore_ascii_case("## Status") {
-            return lines
+    let lines = content.lines().collect::<Vec<_>>();
+    // Conversation folders concatenate immutable checkpoints oldest-to-newest.
+    // Read from the end so the newest checkpoint owns the current status.
+    for (index, line) in lines.iter().enumerate().rev() {
+        let trimmed = line.trim().trim_start_matches(['-', '*']).trim();
+        for prefix in ["Status:", "상태:"] {
+            if let Some(status) = trimmed.strip_prefix(prefix) {
+                let status = clean_summary_field(status, 100, "").to_lowercase();
+                if !status.is_empty() {
+                    return Some(status);
+                }
+            }
+        }
+        if trimmed.eq_ignore_ascii_case("## Status") || trimmed == "## 상태" {
+            return lines[index + 1..]
+                .iter()
                 .find(|candidate| !candidate.trim().is_empty())
                 .map(|status| {
-                    clean_summary_field(status.trim().trim_start_matches('-'), 100, "")
+                    clean_summary_field(status.trim().trim_start_matches(['-', '*']), 100, "")
                         .to_lowercase()
                 });
         }
@@ -1377,9 +2266,34 @@ fn session_status(content: &str) -> Option<String> {
 }
 
 fn status_is_stopped(status: &str) -> bool {
-    ["stopped", "cancelled", "canceled", "중단", "취소"]
-        .iter()
-        .any(|marker| status.contains(marker))
+    status_starts_with(
+        status,
+        &["stopped", "cancelled", "canceled", "중단", "취소"],
+    )
+}
+
+fn status_is_inactive(status: &str) -> bool {
+    status_is_stopped(status)
+        || status_starts_with(
+            status,
+            &[
+                "complete",
+                "completed",
+                "done",
+                "완료",
+                "보류",
+                "hold",
+                "paused",
+            ],
+        )
+}
+
+fn status_starts_with(status: &str, markers: &[&str]) -> bool {
+    let normalized = status
+        .trim()
+        .trim_start_matches(['*', '_', '`'])
+        .trim_start();
+    markers.iter().any(|marker| normalized.starts_with(marker))
 }
 
 fn same_task_title(left: &str, right: &str) -> bool {
@@ -1468,7 +2382,7 @@ fn ensure_latest_next_action(
     if overrides
         .get(filename)
         .is_some_and(|status| status == "stopped")
-        || session_status(content).is_some_and(|status| status_is_stopped(&status))
+        || session_status(content).is_some_and(|status| status_is_inactive(&status))
     {
         return dashboard;
     }
@@ -1531,7 +2445,7 @@ fn render_task_dashboard(dashboard: TaskDashboard) -> Result<String, String> {
         output.push_str("- 현재 진행 중인 작업이 없습니다.\n");
     } else {
         for (title, next, blocked) in active {
-            output.push_str(&format!("- [ ] {title}\n"));
+            output.push_str(&format!("- ⏳ 진행: {title}\n"));
             if !is_none_value(&next) {
                 output.push_str(&format!("  - 다음: {next}\n"));
             }
@@ -1546,7 +2460,7 @@ fn render_task_dashboard(dashboard: TaskDashboard) -> Result<String, String> {
         output.push_str("- 아직 기록된 완료 항목이 없습니다.\n");
     } else {
         for title in completed {
-            output.push_str(&format!("- [x] {title}\n"));
+            output.push_str(&format!("- ✅ 완료: {title}\n"));
         }
     }
     Ok(output)
@@ -1844,9 +2758,14 @@ fn render_decision_dashboard(
 }
 
 async fn initialize_local(room: &AiRoom) -> Result<(), ApiError> {
+    if room.instruction_version > INSTRUCTION_VERSION {
+        return Ok(());
+    }
     let local_root = PathBuf::from(&room.local_root);
     let gitignore_path = local_root.join(".gitignore");
-    let gitignore = fs::read_to_string(&gitignore_path).await.unwrap_or_default();
+    let gitignore = fs::read_to_string(&gitignore_path)
+        .await
+        .unwrap_or_default();
     let updated_gitignore = ensure_room_gitignore_entry(&gitignore);
     if updated_gitignore != gitignore {
         fs::write(gitignore_path, updated_gitignore).await?;
@@ -1866,6 +2785,12 @@ async fn initialize_local(room: &AiRoom) -> Result<(), ApiError> {
             fs::write(path, content).await?;
         }
     }
+    let additional_rules = discover_owner_rule_documents(&room_dir).await?;
+    fs::write(
+        room_dir.join(OWNER_RULES_FILE),
+        owner_working_rules(&additional_rules),
+    )
+    .await?;
     let decisions_path = room_dir.join("decisions.md");
     if let Ok(decisions) = fs::read_to_string(&decisions_path).await
         && !decisions.contains(DECISIONS_MANAGED_COMMENT)
@@ -1882,11 +2807,18 @@ async fn initialize_local(room: &AiRoom) -> Result<(), ApiError> {
     if migrated_tasks != tasks {
         fs::write(tasks_path, migrated_tasks).await?;
     }
-    if fs::metadata(room_dir.join(SESSION_OVERRIDES_FILE))
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(room_dir.join(SESSION_OVERRIDES_FILE))
         .await
-        .is_err()
     {
-        fs::write(room_dir.join(SESSION_OVERRIDES_FILE), "{}\n").await?;
+        Ok(mut file) => {
+            file.write_all(b"{}\n").await?;
+            file.flush().await?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
     }
     let block = managed_agent_block(room);
     for filename in ["AGENTS.md", "CLAUDE.md"] {
@@ -1895,12 +2827,44 @@ async fn initialize_local(room: &AiRoom) -> Result<(), ApiError> {
             .await
             .is_ok_and(|metadata| metadata.file_type().is_symlink())
         {
-            continue;
+            return Err(ApiError::BadRequest(format!(
+                "Cannot install AI Room instructions because {filename} is a symbolic link"
+            )));
         }
         let existing = fs::read_to_string(&path).await.unwrap_or_default();
         fs::write(path, upsert_managed_block(&existing, &block)).await?;
     }
     Ok(())
+}
+
+async fn discover_owner_rule_documents(room_dir: &FsPath) -> Result<Vec<String>, ApiError> {
+    let mut documents = Vec::new();
+    let mut entries = fs::read_dir(room_dir.join(LIBRARY_DIR)).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.eq_ignore_ascii_case(OWNER_RULES_NAME) || !valid_library_filename(&name) {
+            continue;
+        }
+        let normalized = name.to_ascii_lowercase();
+        if [
+            "rule",
+            "instruction",
+            "agreement",
+            "protocol",
+            "convention",
+            "standard",
+            "procedure",
+            "organization",
+            "color",
+        ]
+        .iter()
+        .any(|keyword| normalized.contains(keyword))
+        {
+            documents.push(name);
+        }
+    }
+    documents.sort();
+    Ok(documents)
 }
 
 async fn migrate_root_room_documents(room_dir: &FsPath) -> Result<(), ApiError> {
@@ -1936,13 +2900,13 @@ async fn prepare_remote(room: &AiRoom, alias: &str, root: &str) -> Result<(), Ap
     if existing_remote
         .files
         .keys()
-        .any(|name| name.starts_with("sessions/"))
+        .any(|name| is_session_record_path(name))
     {
         upgrade_remote_instructions(
             room,
             alias,
             root,
-            existing_remote.files.get("ROOM.md").map(String::as_str),
+            &existing_remote.files,
         )
         .await?;
         return Ok(());
@@ -1957,6 +2921,16 @@ async fn prepare_remote(room: &AiRoom, alias: &str, root: &str) -> Result<(), Ap
             ApiError::BadRequest(format!("Local room document is missing: {relative}"))
         })?;
         files.push((relative.to_string(), content));
+    }
+    for (relative, content) in local
+        .files
+        .iter()
+        .filter(|(relative, _)| is_session_record_path(relative))
+    {
+        files.push((relative.clone(), content.clone()));
+    }
+    if let Some(content) = local.files.get(SESSION_OVERRIDES_FILE) {
+        files.push((SESSION_OVERRIDES_FILE.into(), content.clone()));
     }
     let mut library_baseline = BTreeMap::new();
     for (relative, content) in local
@@ -1979,45 +2953,6 @@ async fn prepare_remote(room: &AiRoom, alias: &str, root: &str) -> Result<(), Ap
         files.push((filename.into(), upsert_managed_block(&existing, &block)));
     }
     write_remote_files(alias, root, &files).await
-}
-
-async fn clean_remote_room(
-    alias: &str,
-    root: &str,
-    remote_files: &BTreeMap<String, String>,
-) -> Result<Vec<String>, ApiError> {
-    let mut script = format!(
-        "root={}; room=\"$root/{}\"; for filename in AGENTS.md CLAUDE.md; do file=\"$root/$filename\"; [ -f \"$file\" ] || continue; tmp=\"$file.task-ai-room.$$.tmp\"; awk -v start='{}' -v end='{}' '$0 == start {{ skipping = 1; next }} $0 == end {{ skipping = 0; next }} !skipping {{ print }}' \"$file\" > \"$tmp\" && mv \"$tmp\" \"$file\" || exit 1; [ -s \"$file\" ] || rm -f \"$file\"; done; for name in room.json ROOM.md context.md decisions.md tasks.md {}; do rm -f \"$room/$name\" || exit 1; done; rm -f \"$room\"/sessions/*.md \"$room\"/library/*.md || exit 1;",
-        posix_quote(root),
-        ROOM_DIR,
-        START_MARKER,
-        END_MARKER,
-        LIBRARY_BASELINE_FILE,
-    );
-    for filename in remote_files
-        .keys()
-        .filter_map(|name| name.strip_prefix("root-documents/"))
-    {
-        script.push_str(&format!(
-            " rm -f \"$room/{}\" || exit 1;",
-            filename.replace('"', "")
-        ));
-    }
-    script.push_str(
-        " rmdir \"$room/sessions\" 2>/dev/null || true; rmdir \"$room/library\" 2>/dev/null || true; rmdir \"$room\" 2>/dev/null || true;",
-    );
-    let output = run_remote(alias, &script).await?;
-    if !output.status.success() {
-        return Err(ApiError::BadRequest(format!(
-            "Unable to remove temporary room records on {alias}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(vec![
-        "AGENTS.md managed block".into(),
-        "CLAUDE.md managed block".into(),
-        format!("{ROOM_DIR}/"),
-    ])
 }
 
 async fn delete_remote_library_file(
@@ -2056,6 +2991,75 @@ async fn write_local_file(room: &AiRoom, relative: &str, content: &str) -> Resul
     Ok(())
 }
 
+async fn create_local_session_record(
+    room: &AiRoom,
+    relative: &str,
+    content: &str,
+) -> Result<bool, ApiError> {
+    if !is_session_record_path(relative) {
+        return Err(ApiError::BadRequest("Invalid session record path".into()));
+    }
+    let path = safe_room_path(room, relative)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| ApiError::BadRequest("Invalid session record path".into()))?;
+    fs::create_dir_all(parent).await?;
+    let temporary = parent.join(format!(".task-ai-tmp-{}", Uuid::new_v4()));
+    let write_result = async {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await?;
+        file.write_all(content.as_bytes()).await?;
+        file.flush().await?;
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary).await;
+        return Err(error.into());
+    }
+    match fs::hard_link(&temporary, &path).await {
+        Ok(()) => {
+            let _ = fs::remove_file(&temporary).await;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temporary).await;
+            Ok(false)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary).await;
+            Err(error.into())
+        }
+    }
+}
+
+async fn preserve_local_version(
+    room: &AiRoom,
+    relative: &str,
+    content: &str,
+) -> Result<(), ApiError> {
+    // Validate the original room-relative path before reusing it below the
+    // private history directory. History is deliberately outside the files
+    // discovered by read_local_files, so it cannot re-enter synchronization.
+    safe_room_path(room, relative)?;
+    let history_path = PathBuf::from(&room.local_root)
+        .join(ROOM_DIR)
+        .join(LOCAL_HISTORY_DIR)
+        .join(content_hash(content))
+        .join(relative);
+    if fs::metadata(&history_path).await.is_ok() {
+        return Ok(());
+    }
+    if let Some(parent) = history_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(history_path, content).await?;
+    Ok(())
+}
+
 fn safe_room_path(room: &AiRoom, relative: &str) -> Result<PathBuf, ApiError> {
     if relative.is_empty()
         || relative.contains(['\\', '\0', '\r', '\n'])
@@ -2079,7 +3083,13 @@ async fn write_remote_files(
     let mut script = format!(
         "root={quoted_root}; mkdir -p \"$root/{ROOM_DIR}/sessions\" \"$root/{ROOM_DIR}/library\" || exit 1;"
     );
-    for (relative, content) in files {
+    if files
+        .iter()
+        .any(|(relative, _)| relative == "AGENTS.md" || relative == "CLAUDE.md")
+    {
+        script.push_str(" if [ -L \"$root/AGENTS.md\" ] || [ -L \"$root/CLAUDE.md\" ]; then echo 'Refusing to replace symbolic-link AI instructions' >&2; exit 4; fi;");
+    }
+    for (index, (relative, content)) in files.iter().enumerate() {
         if content.len() > MAX_DOCUMENT_BYTES {
             return Err(ApiError::PayloadTooLarge);
         }
@@ -2088,6 +3098,11 @@ async fn write_remote_files(
         } else {
             format!("$root/{ROOM_DIR}/{relative}")
         };
+        if relative == "AGENTS.md" || relative == "CLAUDE.md" {
+            script.push_str(&format!(
+                " if [ -L \"{target}\" ]; then echo 'Refusing to replace symbolic link: {relative}' >&2; exit 4; fi;"
+            ));
+        }
         let parent = FsPath::new(relative)
             .parent()
             .and_then(FsPath::to_str)
@@ -2097,13 +3112,19 @@ async fn write_remote_files(
                 " mkdir -p \"$root/{ROOM_DIR}/{parent}\" || exit 1;"
             ));
         }
-        script.push_str(&format!(
-            " printf '%s' {} | base64 -d > \"{}\" || exit 1;",
-            posix_quote(&BASE64.encode(content)),
-            target
-        ));
+        let encoded = posix_quote(&BASE64.encode(content));
+        if is_session_record_path(relative) {
+            let temporary = format!("{target}.task-ai-tmp-$${index}");
+            script.push_str(&format!(
+                " printf '%s' {encoded} | base64 -d > \"{temporary}\" || exit 1; if ln \"{temporary}\" \"{target}\" 2>/dev/null; then rm -f \"{temporary}\"; elif cmp -s \"{temporary}\" \"{target}\"; then rm -f \"{temporary}\"; else rm -f \"{temporary}\"; echo 'Session checkpoint already exists with different content: {relative}' >&2; exit 3; fi;"
+            ));
+        } else {
+            script.push_str(&format!(
+                " printf '%s' {encoded} | base64 -d > \"{target}\" || exit 1;"
+            ));
+        }
     }
-    let output = run_remote(alias, &script).await?;
+    let output = run_remote_with_stdin(alias, script.as_bytes()).await?;
     if !output.status.success() {
         return Err(ApiError::BadRequest(format!(
             "Unable to write room files on {alias}: {}",
@@ -2157,6 +3178,26 @@ async fn run_remote(alias: &str, script: &str) -> Result<std::process::Output, A
     run_ssh(&args, Duration::from_secs(20)).await
 }
 
+async fn run_remote_with_stdin(
+    alias: &str,
+    input: &[u8],
+) -> Result<std::process::Output, ApiError> {
+    require_registered_alias(alias).await?;
+    let args = vec![
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=8".into(),
+        "-o".into(),
+        "LogLevel=ERROR".into(),
+        "-o".into(),
+        CLEAR_SEND_ENV.into(),
+        alias.into(),
+        "sh -s".into(),
+    ];
+    run_ssh_with_stdin(&args, input, Duration::from_secs(90)).await
+}
+
 async fn read_local_files(room: &AiRoom) -> EndpointFiles {
     let room_dir = PathBuf::from(&room.local_root).join(ROOM_DIR);
     let mut result = EndpointFiles::default();
@@ -2170,14 +3211,44 @@ async fn read_local_files(room: &AiRoom) -> EndpointFiles {
             result.files.insert(filename.into(), content);
         }
     }
+    if let Ok(content) = fs::read_to_string(room_dir.join(SESSION_OVERRIDES_FILE)).await {
+        result.files.insert(SESSION_OVERRIDES_FILE.into(), content);
+    }
     if let Ok(mut entries) = fs::read_dir(room_dir.join("sessions")).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".md")
+            if is_session_record_name(&name)
                 && let Ok(content) = fs::read_to_string(entry.path()).await
-                && content.len() <= MAX_DOCUMENT_BYTES
             {
-                result.files.insert(format!("sessions/{name}"), content);
+                if content.len() > MAX_DOCUMENT_BYTES {
+                    result.error.get_or_insert_with(|| {
+                        format!("Session checkpoint exceeds the size limit: sessions/{name}")
+                    });
+                } else {
+                    result.files.insert(format!("sessions/{name}"), content);
+                }
+            } else if is_session_component(&name)
+                && let Ok(file_type) = entry.file_type().await
+                && file_type.is_dir()
+                && let Ok(mut checkpoints) = fs::read_dir(entry.path()).await
+            {
+                while let Ok(Some(checkpoint)) = checkpoints.next_entry().await {
+                    let checkpoint_name = checkpoint.file_name().to_string_lossy().into_owned();
+                    let relative = format!("sessions/{name}/{checkpoint_name}");
+                    if is_session_record_path(&relative)
+                        && let Ok(checkpoint_type) = checkpoint.file_type().await
+                        && checkpoint_type.is_file()
+                        && let Ok(content) = fs::read_to_string(checkpoint.path()).await
+                    {
+                        if content.len() > MAX_DOCUMENT_BYTES {
+                            result.error.get_or_insert_with(|| {
+                                format!("Session checkpoint exceeds the size limit: {relative}")
+                            });
+                        } else {
+                            result.files.insert(relative, content);
+                        }
+                    }
+                }
             }
         }
     }
@@ -2201,9 +3272,13 @@ async fn read_remote_files(room: &AiRoom) -> EndpointFiles {
     };
     let script = format!(
         r#"root={root}; room="$root/{room_dir}"; [ -d "$room" ] || exit 2;
-for name in ROOM.md context.md decisions.md tasks.md {baseline}; do
+for name in room.json ROOM.md context.md decisions.md tasks.md {session_overrides} {baseline}; do
   file="$room/$name"; [ -f "$file" ] || continue
   printf '%s\t' "$name"; base64 "$file" | tr -d '\n'; printf '\n'
+done
+for name in AGENTS.md CLAUDE.md; do
+  file="$root/$name"; [ -f "$file" ] || continue
+  printf 'project-root/%s\t' "$name"; base64 "$file" | tr -d '\n'; printf '\n'
 done
 for file in "$room"/*.md; do
   [ -f "$file" ] || continue
@@ -2216,14 +3291,18 @@ for file in "$room"/library/*.md; do
   name=$(basename "$file")
   printf 'library/%s\t' "$name"; base64 "$file" | tr -d '\n'; printf '\n'
 done
-for file in "$room"/sessions/*.md; do
-  [ -f "$file" ] || continue
-  name=$(basename "$file")
-  printf 'sessions/%s\t' "$name"; base64 "$file" | tr -d '\n'; printf '\n'
-done"#,
+if [ -d "$room/sessions" ]; then
+  find "$room/sessions" -mindepth 1 -maxdepth 2 -type f -name '*.md' | sort | while IFS= read -r file; do
+    relative=${{file#"$room/"}}
+    [ "$relative" = "sessions/{session_index}" ] && continue
+    printf '%s\t' "$relative"; base64 "$file" | tr -d '\n'; printf '\n'
+  done
+fi"#,
         root = posix_quote(root),
         room_dir = ROOM_DIR,
+        session_overrides = SESSION_OVERRIDES_FILE,
         baseline = LIBRARY_BASELINE_FILE,
+        session_index = SESSION_INDEX_FILE,
     );
     let output = match run_remote(alias, &script).await {
         Ok(output) => output,
@@ -2237,7 +3316,7 @@ done"#,
     if !output.status.success() {
         return EndpointFiles {
             error: Some(if output.status.code() == Some(2) {
-                "Server is not prepared for a temporary AI session".into()
+                SERVER_NOT_PREPARED_ERROR.into()
             } else {
                 String::from_utf8_lossy(&output.stderr).trim().to_string()
             }),
@@ -2254,15 +3333,29 @@ done"#,
         };
         if let Ok(bytes) = BASE64.decode(encoded)
             && let Ok(content) = String::from_utf8(bytes)
-            && content.len() <= MAX_DOCUMENT_BYTES
-            && (filename == LIBRARY_BASELINE_FILE
-                || (!filename.starts_with("library/") && !filename.starts_with("root-documents/"))
+        {
+            if content.len() > MAX_DOCUMENT_BYTES {
+                result.error.get_or_insert_with(|| {
+                    format!("Remote room record exceeds the size limit: {filename}")
+                });
+                continue;
+            }
+            if matches!(
+                filename,
+                "room.json" | "ROOM.md" | "context.md" | "decisions.md" | "tasks.md"
+            ) || filename == SESSION_OVERRIDES_FILE
+                || filename == LIBRARY_BASELINE_FILE
+                || is_session_record_path(filename)
+                || filename
+                    .strip_prefix("project-root/")
+                    .is_some_and(|name| matches!(name, "AGENTS.md" | "CLAUDE.md"))
                 || filename
                     .strip_prefix("library/")
                     .or_else(|| filename.strip_prefix("root-documents/"))
-                    .is_some_and(valid_library_filename))
-        {
-            result.files.insert(filename.to_string(), content);
+                    .is_some_and(valid_library_filename)
+            {
+                result.files.insert(filename.to_string(), content);
+            }
         }
     }
     result
@@ -2288,57 +3381,7 @@ fn remote_library_documents(files: &BTreeMap<String, String>) -> BTreeMap<String
 async fn build_snapshot(room: AiRoom) -> AiRoomSnapshot {
     let local = read_local_files(&room).await;
     let remote = read_remote_files(&room).await;
-    let mut sessions = Vec::new();
-    let mut conflicts = Vec::new();
-    let mut names = local
-        .files
-        .keys()
-        .chain(remote.files.keys())
-        .filter(|name| name.starts_with("sessions/"))
-        .cloned()
-        .collect::<Vec<_>>();
-    names.sort();
-    names.dedup();
-    names.reverse();
-    for filename in names {
-        match (local.files.get(&filename), remote.files.get(&filename)) {
-            (Some(left), Some(right)) if left == right => sessions.push(AiRoomRecord {
-                filename,
-                content: left.clone(),
-                source: "both".into(),
-            }),
-            (Some(left), Some(right)) if right.starts_with(left) => sessions.push(AiRoomRecord {
-                filename,
-                content: right.clone(),
-                source: "remote".into(),
-            }),
-            (Some(left), Some(right)) if left.starts_with(right) => sessions.push(AiRoomRecord {
-                filename,
-                content: left.clone(),
-                source: "local".into(),
-            }),
-            (Some(left), Some(_)) => {
-                conflicts.push(filename.clone());
-                sessions.push(AiRoomRecord {
-                    filename,
-                    content: left.clone(),
-                    source: "conflict".into(),
-                });
-            }
-            (Some(content), None) => sessions.push(AiRoomRecord {
-                filename,
-                content: content.clone(),
-                source: "local".into(),
-            }),
-            (None, Some(content)) => sessions.push(AiRoomRecord {
-                filename,
-                content: content.clone(),
-                source: "remote".into(),
-            }),
-            _ => {}
-        }
-    }
-    let baseline = library_baseline(&remote.files);
+    let (sessions, conflicts) = aggregate_session_records(&local.files, &remote.files);
     let remote_library = remote_library_documents(&remote.files);
     let mut library = Vec::new();
     for filename in ["ROOM.md", "context.md"] {
@@ -2348,14 +3391,19 @@ async fn build_snapshot(room: AiRoom) -> AiRoomSnapshot {
                 content: left.clone(),
                 source: "both".into(),
             }),
-            (Some(left), Some(_)) => {
-                conflicts.push(filename.into());
-                library.push(AiRoomRecord {
-                    filename: filename.into(),
-                    content: left.clone(),
-                    source: "conflict".into(),
-                });
-            }
+            (Some(left), Some(right)) => library.push(AiRoomRecord {
+                filename: filename.into(),
+                content: if filename == "ROOM.md" {
+                    left.clone()
+                } else {
+                    right.clone()
+                },
+                source: if filename == "ROOM.md" {
+                    "local".into()
+                } else {
+                    "remote".into()
+                },
+            }),
             (Some(content), None) => library.push(AiRoomRecord {
                 filename: filename.into(),
                 content: content.clone(),
@@ -2395,24 +3443,15 @@ async fn build_snapshot(room: AiRoom) -> AiRoomSnapshot {
     library_names.dedup();
     for filename in library_names {
         match (local.files.get(&filename), remote_library.get(&filename)) {
-            (Some(left), Some(right)) => {
-                let action =
-                    library_merge_action(left, right, baseline.get(&filename).map(String::as_str));
-                let (content, source) = match action {
-                    LibraryMergeAction::Same => (left.clone(), "both"),
-                    LibraryMergeAction::AcceptRemote => (right.clone(), "remote"),
-                    LibraryMergeAction::KeepLocal => (left.clone(), "local"),
-                    LibraryMergeAction::Conflict => {
-                        conflicts.push(filename.clone());
-                        (left.clone(), "conflict")
-                    }
-                };
-                library.push(AiRoomRecord {
-                    filename,
-                    content,
-                    source: source.into(),
-                });
-            }
+            (Some(left), Some(right)) => library.push(AiRoomRecord {
+                filename,
+                content: if left == right {
+                    left.clone()
+                } else {
+                    right.clone()
+                },
+                source: if left == right { "both" } else { "remote" }.into(),
+            }),
             (Some(content), None) => library.push(AiRoomRecord {
                 filename,
                 content: content.clone(),
@@ -2434,26 +3473,57 @@ async fn build_snapshot(room: AiRoom) -> AiRoomSnapshot {
             .cloned()
             .unwrap_or_default()
     };
+    let remote_value = |name: &str| {
+        remote
+            .files
+            .get(name)
+            .or_else(|| local.files.get(name))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let session_overrides =
+        read_session_overrides(&PathBuf::from(&room.local_root).join(ROOM_DIR)).await;
+    let checkpoint_health = checkpoint_health(&room, &sessions, &session_overrides).await;
+    let managed_block = managed_agent_block(&room);
+    let local_managed = {
+        let mut installed = true;
+        for filename in ["AGENTS.md", "CLAUDE.md"] {
+            let content = fs::read_to_string(PathBuf::from(&room.local_root).join(filename))
+                .await
+                .unwrap_or_default();
+            installed &= content.contains(&managed_block);
+        }
+        installed
+    };
+    let remote_managed = ["AGENTS.md", "CLAUDE.md"].iter().all(|filename| {
+        remote
+            .files
+            .get(&format!("project-root/{filename}"))
+            .is_some_and(|content| content.contains(&managed_block))
+    });
     AiRoomSnapshot {
         instruction: value("ROOM.md"),
-        context: value("context.md"),
+        context: remote_value("context.md"),
         decisions: value("decisions.md"),
         tasks: value("tasks.md"),
         sessions,
-        session_overrides: read_session_overrides(&PathBuf::from(&room.local_root).join(ROOM_DIR))
-            .await,
+        checkpoint_health,
+        local_summary_enabled: local_summary_enabled(),
+        session_overrides,
         library,
         conflicts,
         local: AiRoomEndpointState {
             configured: true,
             available: local.available,
-            instruction_installed: local.files.contains_key("ROOM.md"),
+            instruction_installed: local.files.get("ROOM.md") == Some(&room_instruction(&room))
+                && local_managed,
             error: local.error,
         },
         remote: AiRoomEndpointState {
             configured: room.ssh_alias.is_some(),
             available: remote.available,
-            instruction_installed: remote.files.contains_key("ROOM.md"),
+            instruction_installed: remote.files.get("ROOM.md") == Some(&room_instruction(&room))
+                && remote_managed,
             error: remote.error,
         },
         room,
@@ -2503,6 +3573,12 @@ pub fn router() -> Router<DeploymentImpl> {
             "/ai-rooms/{room_id}",
             get(get_room_snapshot).delete(delete_room),
         )
+        .route("/ai-rooms/{room_id}/storage", get(get_room_storage))
+        .route("/ai-rooms/{room_id}/profile", put(update_room_profile))
+        .route(
+            "/ai-rooms/{room_id}/connection",
+            put(update_room_connection),
+        )
         .route("/ai-rooms/{room_id}/initialize", post(initialize_room))
         .route(
             "/ai-rooms/{room_id}/prepare-remote",
@@ -2529,6 +3605,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_activity_scan_skips_excluded_directories() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join(".git").join("HEAD"), "ref").unwrap();
+        std::fs::create_dir_all(root.path().join(ROOM_DIR).join("sessions")).unwrap();
+        std::fs::write(
+            root.path().join(ROOM_DIR).join("sessions").join("a.md"),
+            "session",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "managed block").unwrap();
+        std::fs::write(root.path().join("CLAUDE.md"), "managed block").unwrap();
+        assert!(latest_workspace_activity(root.path()).is_none());
+
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src").join("main.rs"), "fn main() {}").unwrap();
+        assert!(latest_workspace_activity(root.path()).is_some());
+    }
+
+    #[test]
+    fn unrecorded_activity_requires_recent_work_and_stale_records() {
+        let fresh = Some(Duration::from_secs(60));
+        let stale_record = Some(CHECKPOINT_OVERDUE_AFTER + Duration::from_secs(1));
+        let old_activity = Some(ACTIVITY_RECENT_WINDOW + Duration::from_secs(1));
+
+        assert!(is_unrecorded_activity(fresh, None));
+        assert!(is_unrecorded_activity(fresh, stale_record));
+        assert!(!is_unrecorded_activity(fresh, fresh));
+        assert!(!is_unrecorded_activity(old_activity, None));
+        assert!(!is_unrecorded_activity(None, None));
+        assert!(is_unrecorded_activity(
+            Some(ACTIVITY_RECENT_WINDOW),
+            Some(CHECKPOINT_OVERDUE_AFTER)
+        ));
+        assert!(!is_unrecorded_activity(
+            Some(ACTIVITY_RECENT_WINDOW + Duration::from_secs(1)),
+            None
+        ));
+    }
+
+    #[test]
+    fn summary_retry_backs_off_and_stays_capped() {
+        assert_eq!(summary_retry_delay(1), SUMMARY_RETRY_BACKOFF_BASE);
+        assert_eq!(summary_retry_delay(2), SUMMARY_RETRY_BACKOFF_BASE * 2);
+        assert_eq!(summary_retry_delay(3), SUMMARY_RETRY_BACKOFF_BASE * 4);
+        // Every later failure is clamped, so a room that can never converge
+        // never returns to the 45 second cadence that pinned the GPU.
+        assert_eq!(summary_retry_delay(9), SUMMARY_RETRY_BACKOFF_MAX);
+        assert_eq!(summary_retry_delay(u32::MAX), SUMMARY_RETRY_BACKOFF_MAX);
+        assert!(summary_retry_delay(1) > TASK_SUMMARY_INTERVAL);
+    }
+
+    #[test]
+    fn local_summary_stays_off_unless_explicitly_enabled() {
+        // SAFETY: the summarizer switch is read from the process environment,
+        // and this test owns the variable for its duration.
+        unsafe {
+            env::remove_var(LOCAL_SUMMARY_ENV);
+            assert!(!local_summary_enabled());
+
+            for off in ["", " ", "0", "false", "no"] {
+                env::set_var(LOCAL_SUMMARY_ENV, off);
+                assert!(!local_summary_enabled(), "{off:?} must not enable it");
+            }
+
+            for on in ["1", "true", "TRUE", " on "] {
+                env::set_var(LOCAL_SUMMARY_ENV, on);
+                assert!(local_summary_enabled(), "{on:?} must enable it");
+            }
+
+            env::remove_var(LOCAL_SUMMARY_ENV);
+        }
+    }
+
+    #[test]
     fn preserves_existing_agent_instructions() {
         let block = format!("{START_MARKER}\nnew\n{END_MARKER}");
         assert_eq!(
@@ -2542,6 +3693,144 @@ mod tests {
             ),
             format!("before\n{block}\nafter")
         );
+        assert_eq!(
+            upsert_managed_block(&format!("before\n{START_MARKER}\nbroken old block"), &block),
+            format!("before\n\nbroken old block\n\n{block}\n")
+        );
+        assert_eq!(
+            upsert_managed_block(&format!("broken old block\n{END_MARKER}\nafter"), &block),
+            format!("broken old block\n\nafter\n\n{block}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrades_an_existing_room_to_append_only_session_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let room_dir = root.path().join(ROOM_DIR);
+        fs::create_dir_all(room_dir.join("sessions")).await.unwrap();
+        fs::create_dir_all(room_dir.join(LIBRARY_DIR)).await.unwrap();
+        fs::write(
+            room_dir.join("ROOM.md"),
+            "# AI Room: old\nInstruction version: 15\nCreate one session file.",
+        )
+        .await
+        .unwrap();
+        fs::write(room_dir.join("sessions/legacy.md"), "legacy body")
+            .await
+            .unwrap();
+        fs::write(
+            root.path().join("AGENTS.md"),
+            format!("owner before\n{START_MARKER}\nold managed block\n{END_MARKER}\nowner after"),
+        )
+        .await
+        .unwrap();
+        let room = AiRoom {
+            id: Uuid::nil(),
+            name: "existing room".into(),
+            description: None,
+            local_root: normalized_local_path(root.path()),
+            ssh_alias: None,
+            remote_root: None,
+            instruction_version: 15,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        initialize_local(&room).await.unwrap();
+
+        let instruction = fs::read_to_string(room_dir.join("ROOM.md")).await.unwrap();
+        assert!(instruction.contains("Instruction version: 16"));
+        assert!(instruction.contains("<random-id>"));
+        assert!(instruction.contains("never edit, replace, rename, or delete"));
+        let agents = fs::read_to_string(root.path().join("AGENTS.md"))
+            .await
+            .unwrap();
+        assert!(agents.contains("owner before"));
+        assert!(agents.contains("owner after"));
+        assert!(agents.contains("<random-id>"));
+        assert_eq!(agents.matches(START_MARKER).count(), 1);
+        assert_eq!(
+            fs::read_to_string(room_dir.join("sessions/legacy.md"))
+                .await
+                .unwrap(),
+            "legacy body"
+        );
+    }
+
+    #[test]
+    fn requires_user_visible_progress_reports_every_five_minutes() {
+        let room = AiRoom {
+            id: Uuid::nil(),
+            name: "room".into(),
+            description: None,
+            local_root: "C:/work".into(),
+            ssh_alias: None,
+            remote_root: None,
+            instruction_version: INSTRUCTION_VERSION,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let room_guide = room_instruction(&room);
+        let agent_guide = managed_agent_block(&room);
+
+        assert!(room_guide.contains("user-visible progress report"));
+        assert!(room_guide.contains("every 5 minutes of wall-clock time"));
+        assert!(room_guide.contains("session-file checkpoint does not count"));
+        assert!(room_guide.contains("block reporting for 4 minutes or longer"));
+        assert!(room_guide.contains("poll it at intervals of at most 60 seconds"));
+        assert!(room_guide.contains("library/owner-working-rules.md"));
+        assert!(room_guide.contains("one unique `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<random-id>/`"));
+        assert!(room_guide.contains("at least 8 random hexadecimal characters"));
+        assert!(room_guide.contains("never edit, replace, rename, or delete an earlier checkpoint"));
+        assert!(room_guide.contains(ADVERSARIAL_REVIEW_FILE));
+        assert!(room_guide.contains("two independent critics"));
+        assert!(agent_guide.contains("visible progress report"));
+        assert!(agent_guide.contains("at least every 5 minutes"));
+        assert!(agent_guide.contains("Session-file writes do not count"));
+        assert!(agent_guide.contains("block reporting for 4 minutes or longer"));
+        assert!(agent_guide.contains("library/owner-working-rules.md"));
+        assert!(agent_guide.contains("Never rewrite, rename, or delete an existing checkpoint"));
+        assert!(agent_guide.contains(ADVERSARIAL_REVIEW_FILE));
+        assert!(agent_guide.contains("two-independent-critic"));
+
+        let initial = initial_files(&room);
+        assert!(initial.iter().any(|(name, content)| {
+            name == OWNER_RULES_FILE && content.contains("프로젝트 소유자의 AI 작업 규칙")
+        }));
+        assert!(initial.iter().any(|(name, content)| {
+            name == ADVERSARIAL_REVIEW_FILE && content.contains("3권 분립형 적대 코드 검토 규약")
+        }));
+    }
+
+    #[tokio::test]
+    async fn indexes_existing_owner_rule_documents() {
+        let root = tempfile::tempdir().unwrap();
+        let library = root.path().join(LIBRARY_DIR);
+        fs::create_dir_all(&library).await.unwrap();
+        for name in [
+            "rules-working-agreement.md",
+            "result-organization-standard.md",
+            "module-ai-cow.md",
+            OWNER_RULES_NAME,
+        ] {
+            fs::write(library.join(name), format!("# {name}"))
+                .await
+                .unwrap();
+        }
+
+        let documents = discover_owner_rule_documents(root.path()).await.unwrap();
+        assert_eq!(
+            documents,
+            vec![
+                "result-organization-standard.md".to_string(),
+                "rules-working-agreement.md".to_string(),
+            ]
+        );
+        let rendered = owner_working_rules(&documents);
+        assert!(rendered.contains("진행 보고와 세션 기록은 별개"));
+        assert!(rendered.contains("rules-working-agreement.md"));
+        assert!(!rendered.contains("module-ai-cow.md"));
     }
 
     #[test]
@@ -2558,6 +3847,34 @@ mod tests {
             ensure_room_gitignore_entry("target/\n/.ai-room\n"),
             "target/\n/.ai-room\n"
         );
+    }
+
+    #[tokio::test]
+    async fn creates_missing_local_root_and_requires_approval_for_existing_files() {
+        let base = tempfile::tempdir().unwrap();
+        let missing = base.path().join("new-project");
+        assert!(prepare_local_root(&missing, false).await.unwrap());
+        assert!(fs::metadata(&missing).await.unwrap().is_dir());
+
+        let existing = base.path().join("existing-project");
+        fs::create_dir_all(&existing).await.unwrap();
+        fs::write(existing.join("README.md"), "existing")
+            .await
+            .unwrap();
+        let error = prepare_local_root(&existing, false).await.unwrap_err();
+        assert!(error.to_string().contains(LOCAL_ROOT_NOT_EMPTY_MARKER));
+        assert!(!prepare_local_root(&existing, true).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn rejects_folder_with_existing_room_installation() {
+        let base = tempfile::tempdir().unwrap();
+        let room_dir = base.path().join(ROOM_DIR);
+        fs::create_dir_all(&room_dir).await.unwrap();
+        fs::write(room_dir.join("room.json"), "{}").await.unwrap();
+
+        let error = prepare_local_root(base.path(), true).await.unwrap_err();
+        assert!(error.to_string().contains("another AI Room"));
     }
 
     #[test]
@@ -2592,22 +3909,114 @@ mod tests {
     }
 
     #[test]
-    fn waits_until_every_remote_session_is_complete() {
-        let mut files = BTreeMap::new();
-        files.insert("tasks.md".into(), "# Tasks".into());
-        assert!(!all_remote_sessions_complete(&files));
-
-        files.insert(
-            "sessions/one.md".into(),
-            format!("finished\n{SESSION_COMPLETE_MARKER}\n"),
+    fn includes_room_description_in_instruction() {
+        let mut room = AiRoom {
+            id: Uuid::nil(),
+            name: "room".into(),
+            description: Some("돼지 데이터 세트 구축 AI를 관리하는 룸".into()),
+            local_root: "C:/work".into(),
+            ssh_alias: None,
+            remote_root: None,
+            instruction_version: INSTRUCTION_VERSION,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        assert!(
+            room_instruction(&room).contains("Description: 돼지 데이터 세트 구축 AI를 관리하는 룸")
         );
-        assert!(all_remote_sessions_complete(&files));
+        room.description = None;
+        assert!(!room_instruction(&room).contains("Description:"));
+    }
 
-        files.insert(
-            "sessions/two.md".into(),
-            format!("{SESSION_COMPLETE_MARKER}\nstill working"),
+    #[test]
+    fn keeps_server_room_records_persistent() {
+        let room = AiRoom {
+            id: Uuid::nil(),
+            name: "room".into(),
+            description: None,
+            local_root: "C:/work".into(),
+            ssh_alias: None,
+            remote_root: None,
+            instruction_version: INSTRUCTION_VERSION,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let guide = room_instruction(&room);
+        assert!(guide.contains("Server room records are persistent"));
+        assert!(guide.contains("never deletes them automatically"));
+        assert!(!guide.contains("removes the temporary server room"));
+        assert!(!guide.contains("safe server cleanup"));
+    }
+
+    #[test]
+    fn recognizes_structured_session_status_and_excludes_generated_index() {
+        assert!(is_session_record_path(
+            "sessions/20260803-004413-claude-example.md"
+        ));
+        assert!(is_session_record_path(
+            "sessions/20260810-091000-codex-chat-a/000001-start.md"
+        ));
+        assert!(!is_session_record_path("sessions/INDEX.md"));
+        assert!(!is_session_record_path(
+            "sessions/chat-a/nested/000001-start.md"
+        ));
+        assert!(!is_session_record_path(
+            "sessions/../000001-start.md"
+        ));
+        assert_eq!(
+            session_status("# Session: example\n\n- Agent: Claude\n- Module: UI\n- Status: 완료\n")
+                .as_deref(),
+            Some("완료")
         );
-        assert!(!all_remote_sessions_complete(&files));
+        assert_eq!(
+            session_status("# 기록\n\n## 상태\n\n- 중단\n").as_deref(),
+            Some("중단")
+        );
+        assert!(status_is_inactive("완료"));
+        assert!(status_is_inactive("보류"));
+        assert!(!status_is_inactive("진행중"));
+        assert!(!status_is_inactive(
+            "**진행 중** — 기록 통합 완료, 환경 구축은 미착수"
+        ));
+        assert!(status_is_inactive("**완료** — 검증까지 끝남"));
+    }
+
+    #[test]
+    fn groups_append_only_checkpoints_by_conversation_and_uses_latest_status() {
+        let local = BTreeMap::from([
+            (
+                "sessions/20260810-091000-codex-chat-a/000001-start.md".into(),
+                "# Session: example\n- Status: 진행중\n\nstarted".into(),
+            ),
+            (
+                "sessions/20260810-091000-codex-chat-a/000002-finish.md".into(),
+                format!(
+                    "# Session: example\n- Status: 완료\n\nfinished\n{SESSION_COMPLETE_MARKER}"
+                ),
+            ),
+            (
+                "sessions/20260809-120000-claude-legacy.md".into(),
+                "legacy".into(),
+            ),
+        ]);
+
+        let (records, conflicts) = aggregate_session_records(&local, &BTreeMap::new());
+
+        assert!(conflicts.is_empty());
+        assert_eq!(records.len(), 2);
+        let conversation = records
+            .iter()
+            .find(|record| record.filename.ends_with("codex-chat-a"))
+            .unwrap();
+        assert_eq!(
+            conversation
+                .content
+                .matches("<!-- AI Room checkpoint:")
+                .count(),
+            2
+        );
+        assert_eq!(session_status(&conversation.content).as_deref(), Some("완료"));
+        assert!(session_is_complete(&conversation.content));
     }
 
     #[test]
@@ -2700,10 +4109,10 @@ mod tests {
 
         assert!(rendered.contains("## 진행 중"));
         assert!(rendered.contains("## 완료"));
-        assert_eq!(rendered.matches("- [ ] 벤치마크 실행").count(), 1);
-        assert!(!rendered.contains("- [ ] 결과 폴더 정리"));
-        assert!(rendered.contains("- [x] 결과 폴더 정리"));
-        assert!(rendered.contains("- [x] 표 / 통합 완료"));
+        assert_eq!(rendered.matches("- ⏳ 진행: 벤치마크 실행").count(), 1);
+        assert!(!rendered.contains("- ⏳ 진행: 결과 폴더 정리"));
+        assert!(rendered.contains("- ✅ 완료: 결과 폴더 정리"));
+        assert!(rendered.contains("- ✅ 완료: 표 / 통합 완료"));
         assert!(rendered.contains("  - 다음: 가중치 찾기"));
         assert!(rendered.contains("  - 차단: 모델 경로 미확인"));
     }
@@ -2752,7 +4161,7 @@ mod tests {
             &BTreeMap::new(),
         ))
         .unwrap();
-        assert!(rendered.contains("- [ ] pair-identity 분기(exp34+)."));
+        assert!(rendered.contains("- ⏳ 진행: pair-identity 분기(exp34+)."));
     }
 
     #[test]
@@ -2784,7 +4193,7 @@ mod tests {
             render_task_dashboard(remove_stopped_sessions(dashboard, &sessions, &overrides))
                 .unwrap();
         assert!(!rendered.contains("FMPose3D"));
-        assert!(rendered.contains("- [x] Keep this result"));
+        assert!(rendered.contains("- ✅ 완료: Keep this result"));
     }
 
     #[test]
@@ -2888,35 +4297,6 @@ mod tests {
         assert!(!is_reserved_room_filename("deploy-notes.md"));
     }
 
-    #[test]
-    fn three_way_merges_library_documents_safely() {
-        let base = "# Method\n\nOriginal";
-        let local = "# Method\n\nLocal edit";
-        let remote = "# Method\n\nRemote edit";
-        let baseline = content_hash(base);
-
-        assert_eq!(
-            library_merge_action(base, remote, Some(&baseline)),
-            LibraryMergeAction::AcceptRemote
-        );
-        assert_eq!(
-            library_merge_action(local, base, Some(&baseline)),
-            LibraryMergeAction::KeepLocal
-        );
-        assert_eq!(
-            library_merge_action(local, remote, Some(&baseline)),
-            LibraryMergeAction::Conflict
-        );
-        assert_eq!(
-            library_merge_action(remote, remote, Some(&baseline)),
-            LibraryMergeAction::Same
-        );
-        assert_eq!(
-            library_merge_action(local, remote, None),
-            LibraryMergeAction::Conflict
-        );
-    }
-
     #[tokio::test]
     async fn discovers_ai_created_library_documents() {
         let root = tempfile::tempdir().unwrap();
@@ -2952,7 +4332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_forwards_active_remote_session_without_cleanup() {
+    async fn preserves_a_diverged_legacy_session_in_place() {
         let root = tempfile::tempdir().unwrap();
         let room_dir = root.path().join(ROOM_DIR);
         fs::create_dir_all(room_dir.join("sessions")).await.unwrap();
@@ -2984,13 +4364,222 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(copied, vec!["sessions/active.md"]);
-        assert!(conflicts.is_empty());
+        assert!(copied.is_empty());
+        assert_eq!(conflicts, vec!["sessions/active.md"]);
         assert_eq!(
             fs::read_to_string(room_dir.join("sessions/active.md"))
                 .await
                 .unwrap(),
-            "checkpoint one\ncheckpoint two"
+            "checkpoint one"
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_nested_conversation_checkpoints_without_flattening_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let conversation = root
+            .path()
+            .join(ROOM_DIR)
+            .join("sessions/20260810-091000-codex-chat-a");
+        fs::create_dir_all(&conversation).await.unwrap();
+        fs::write(conversation.join("000001-start.md"), "first")
+            .await
+            .unwrap();
+        fs::write(conversation.join("000002-checkpoint.md"), "second")
+            .await
+            .unwrap();
+        let room = AiRoom {
+            id: Uuid::nil(),
+            name: "room".into(),
+            description: None,
+            local_root: normalized_local_path(root.path()),
+            ssh_alias: None,
+            remote_root: None,
+            instruction_version: INSTRUCTION_VERSION,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let files = read_local_files(&room).await;
+
+        assert_eq!(
+            files
+                .files
+                .get("sessions/20260810-091000-codex-chat-a/000001-start.md")
+                .map(String::as_str),
+            Some("first")
+        );
+        assert_eq!(
+            files
+                .files
+                .get("sessions/20260810-091000-codex-chat-a/000002-checkpoint.md")
+                .map(String::as_str),
+            Some("second")
+        );
+    }
+
+    #[tokio::test]
+    async fn never_overwrites_a_diverged_append_only_checkpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint = root
+            .path()
+            .join(ROOM_DIR)
+            .join("sessions/20260810-091000-codex-chat-a/000001-start.md");
+        fs::create_dir_all(checkpoint.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(&checkpoint, "local immutable body").await.unwrap();
+        let room = AiRoom {
+            id: Uuid::nil(),
+            name: "room".into(),
+            description: None,
+            local_root: normalized_local_path(root.path()),
+            ssh_alias: None,
+            remote_root: None,
+            instruction_version: INSTRUCTION_VERSION,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let mut local = read_local_files(&room).await;
+        let relative = "sessions/20260810-091000-codex-chat-a/000001-start.md";
+        let remote = EndpointFiles {
+            available: true,
+            files: BTreeMap::from([(relative.into(), "remote replacement".into())]),
+            ..Default::default()
+        };
+
+        let (copied, conflicts) = sync_remote_checkpoints(&room, &mut local, &remote)
+            .await
+            .unwrap();
+
+        assert!(copied.is_empty());
+        assert_eq!(conflicts, vec![relative]);
+        assert_eq!(fs::read_to_string(checkpoint).await.unwrap(), "local immutable body");
+    }
+
+    #[tokio::test]
+    async fn create_new_session_record_never_replaces_a_racing_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let room = AiRoom {
+            id: Uuid::nil(),
+            name: "room".into(),
+            description: None,
+            local_root: normalized_local_path(root.path()),
+            ssh_alias: None,
+            remote_root: None,
+            instruction_version: INSTRUCTION_VERSION,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let relative = "sessions/20260810-091000-codex-chat-a/000001-start.md";
+
+        assert!(
+            create_local_session_record(&room, relative, "racing local body")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !create_local_session_record(&room, relative, "remote body")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(safe_room_path(&room, relative).unwrap())
+                .await
+                .unwrap(),
+            "racing local body"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_diverged_server_records_and_preserves_local_history() {
+        let root = tempfile::tempdir().unwrap();
+        let room_dir = root.path().join(ROOM_DIR);
+        fs::create_dir_all(room_dir.join("sessions")).await.unwrap();
+        fs::create_dir_all(room_dir.join(LIBRARY_DIR))
+            .await
+            .unwrap();
+        fs::write(room_dir.join("sessions/active.md"), "local session edit")
+            .await
+            .unwrap();
+        fs::write(
+            room_dir.join(LIBRARY_DIR).join("guide.md"),
+            "local guide edit",
+        )
+        .await
+        .unwrap();
+        fs::write(room_dir.join("context.md"), "local context edit")
+            .await
+            .unwrap();
+        let room = AiRoom {
+            id: Uuid::nil(),
+            name: "room".into(),
+            description: None,
+            local_root: normalized_local_path(root.path()),
+            ssh_alias: None,
+            remote_root: None,
+            instruction_version: INSTRUCTION_VERSION,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let mut local = read_local_files(&room).await;
+        let remote = EndpointFiles {
+            available: true,
+            files: BTreeMap::from([
+                ("sessions/active.md".into(), "server session edit".into()),
+                ("library/guide.md".into(), "server guide edit".into()),
+                ("context.md".into(), "server context edit".into()),
+            ]),
+            ..Default::default()
+        };
+
+        let (copied, conflicts) = sync_remote_checkpoints(&room, &mut local, &remote)
+            .await
+            .unwrap();
+
+        assert_eq!(conflicts, vec!["sessions/active.md"]);
+        assert_eq!(copied.len(), 1);
+        assert_eq!(
+            fs::read_to_string(room_dir.join("sessions/active.md"))
+                .await
+                .unwrap(),
+            "local session edit"
+        );
+        assert_eq!(
+            fs::read_to_string(room_dir.join(LIBRARY_DIR).join("guide.md"))
+                .await
+                .unwrap(),
+            "server guide edit"
+        );
+        // The owner-authored context keeps the local edit; the server copy is
+        // updated instead of the other way around.
+        assert_eq!(
+            fs::read_to_string(room_dir.join("context.md"))
+                .await
+                .unwrap(),
+            "local context edit"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                room_dir
+                    .join(LOCAL_HISTORY_DIR)
+                    .join(content_hash("local session edit"))
+                    .join("sessions/active.md")
+            )
+            .await
+            .unwrap(),
+            "local session edit"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                room_dir
+                    .join(LOCAL_HISTORY_DIR)
+                    .join(content_hash("local guide edit"))
+                    .join("library/guide.md")
+            )
+            .await
+            .unwrap(),
+            "local guide edit"
         );
     }
 }

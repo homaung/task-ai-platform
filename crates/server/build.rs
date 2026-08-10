@@ -30,7 +30,6 @@ fn main() {
             vk_shared_relay_api_base
         );
     }
-
     // Create packages/local-web/dist directory if it doesn't exist
     let dist_path = Path::new("../../packages/local-web/dist");
     if !dist_path.exists() {

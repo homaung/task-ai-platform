@@ -6,7 +6,7 @@ use axum::{
 use reqwest::{StatusCode, header};
 use rust_embed::RustEmbed;
 
-// The production binary embeds and serves the current local web build directly.
+// The production binary embeds the completed local-web build used for this release.
 #[derive(RustEmbed)]
 #[folder = "../../packages/local-web/dist"]
 pub struct Assets;
