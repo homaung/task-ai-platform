@@ -412,8 +412,8 @@ export function AiRoomsPage() {
       setSnapshot(result.snapshot);
       setNotice(
         result.conflicts.length
-          ? `${result.copied_to_local.length}개 기록을 로컬로 복사했고 ${result.conflicts.length}개 충돌은 서버에 보존했습니다.`
-          : `${result.copied_to_local.length}개 체크포인트를 로컬로 복사했습니다. 서버 기록은 상주 유지됩니다.`
+          ? `합집합 동기화: 로컬에 ${result.copied_to_local.length}개, 서버에 ${result.copied_to_remote.length}개를 추가했습니다. ${result.conflicts.length}개 경로 충돌은 두 내용 모두 별도 기록으로 보존했습니다.`
+          : `합집합 동기화 완료: 로컬에 ${result.copied_to_local.length}개, 서버에 ${result.copied_to_remote.length}개를 추가해 양쪽 세션 기록을 맞췄습니다.`
       );
     } catch (reason) {
       setError(errorMessage(reason));
@@ -917,7 +917,8 @@ export function AiRoomsPage() {
               <div className="rounded-md bg-primary p-3 text-xs leading-5 text-low">
                 생성하면 로컬 프로젝트에 <code>.ai-room</code> 설명서, 룸 문서
                 보관함, 세션 폴더를 만듭니다. 서버 기록은 준비 후 상주하며
-                자동으로 삭제되지 않고, 동기화로 로컬과 함께 유지됩니다.
+                자동으로 삭제되지 않습니다. 동기화할 때 로컬과 서버 기록의
+                합집합을 만들어 양쪽에 똑같이 보관합니다.
               </div>
               <div className="flex justify-end gap-2">
                 <button

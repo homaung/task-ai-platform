@@ -13,6 +13,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use chrono::Utc;
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -22,6 +23,7 @@ use tokio::{
 };
 use ts_rs::TS;
 use utils::{command_ext::NoWindowExt, response::ApiResponse};
+use uuid::Uuid;
 
 use crate::{
     DeploymentImpl,
@@ -35,7 +37,6 @@ const PROGRESS_REMINDER_POLL: Duration = Duration::from_secs(1);
 const PROGRESS_REMINDER_INPUT_IDLE: Duration = Duration::from_secs(2);
 const SAFE_SET_ENV: &str = "SetEnv=TASK_AI_PLATFORM=1";
 const CLEAR_SEND_ENV: &str = "SendEnv=-*";
-const SESSION_START_REMINDER: &str = "프로젝트 작업 전에 가장 가까운 .ai-room/ROOM.md와 library/owner-working-rules.md를 읽으세요. 이 대화창만의 sessions/YYYYMMDD-HHMMSS-agent-random-id/ 폴더를 만드세요. random-id는 임의의 16진수 8자 이상이어야 하며 이미 있는 폴더명은 다시 쓰지 마세요. 그 안에 000001-start.md를 작성한 뒤 작업하세요. 이후 각 사용자 최종 응답 직전에 다음 순번 Markdown 파일을 새로 추가하고, 기존 체크포인트는 절대 수정·교체·삭제하지 마세요. 세션 기록을 5분마다 기계적으로 쓰지는 마세요. 코드나 실행 설정을 변경했다면 완료 응답 전에 library/adversarial-code-review-protocol.md의 독립 감사관 2명과 실행 증거 기반 검토를 반드시 수행하세요.\r";
 const PROGRESS_REMINDER: &str = "지금 하던 작업을 취소하지 말고, 먼저 사용자에게 현재까지 완료한 일, 지금 하는 일, 막힌 점, 다음 할 일을 짧게 중간 보고한 뒤 계속 작업하세요. 세션 파일 기록만 하지 말고 사용자 대화에 직접 보고하세요.\r";
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -494,14 +495,42 @@ pub async fn inspect_ssh_host(
     Ok(ResponseJson(ApiResponse::success(info)))
 }
 
-fn terminal_script(path: &str, tool: SshLaunchTool) -> String {
+fn terminal_script(path: &str, tool: SshLaunchTool, session_dir: Option<&str>) -> String {
     let quoted_path = posix_quote(path);
     let executable = match tool {
         SshLaunchTool::Shell => "exec \"${SHELL:-/bin/sh}\" -l",
         SshLaunchTool::Claude => "exec claude",
         SshLaunchTool::Codex => "exec codex",
     };
-    format!("cd -- {quoted_path} || exit 1; {executable}")
+    let session_setup = session_dir.map_or_else(String::new, |session_dir| {
+        let session_leaf = session_dir.rsplit('/').next().unwrap_or(session_dir);
+        let agent = match tool {
+            SshLaunchTool::Claude => "Claude",
+            SshLaunchTool::Codex => "Codex",
+            SshLaunchTool::Shell => "Shell",
+        };
+        let started = Utc::now().format("%Y-%m-%d %H:%M UTC");
+        let body = format!(
+            "# Session: 새 대화 시작\n- Agent: {agent}\n- Module: project\n- Status: 진행중\n- Started: {started}\n\n## Goal\n\n이 대화의 작업 목표와 첫 결과를 다음 체크포인트에 기록한다.\n"
+        );
+        format!(
+            "room_root=$PWD; while [ \"$room_root\" != / ] && [ ! -d \"$room_root/.ai-room/sessions\" ]; do parent=$(dirname -- \"$room_root\"); [ \"$parent\" = \"$room_root\" ] && break; room_root=$parent; done; if [ -d \"$room_root/.ai-room/sessions\" ]; then session_dir=\"$room_root/.ai-room/sessions/\"{}; mkdir -- \"$session_dir\" || exit 1; printf '%s' {} | base64 -d > \"$session_dir/000001-start.md\" || exit 1; export TASK_AI_SESSION_DIR=\"$session_dir\"; fi; ",
+            posix_quote(session_leaf),
+            posix_quote(&BASE64.encode(body))
+        )
+    });
+    format!("cd -- {quoted_path} || exit 1; {session_setup}{executable}")
+}
+
+fn new_terminal_session_dir(tool: SshLaunchTool) -> Option<String> {
+    let agent = match tool {
+        SshLaunchTool::Shell => return None,
+        SshLaunchTool::Claude => "claude",
+        SshLaunchTool::Codex => "codex",
+    };
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
+    let random = &Uuid::new_v4().simple().to_string()[..12];
+    Some(format!(".ai-room/sessions/{timestamp}-{agent}-{random}"))
 }
 
 fn agent_script(path: &str, tool: SshLaunchTool, prompt: &str) -> Result<String, ApiError> {
@@ -748,7 +777,11 @@ async fn handle_ssh_terminal(
         "-o".to_string(),
         CLEAR_SEND_ENV.to_string(),
         query.alias,
-        remote_shell_command(&terminal_script(&query.path, query.tool)),
+        remote_shell_command(&terminal_script(
+            &query.path,
+            query.tool,
+            new_terminal_session_dir(query.tool).as_deref(),
+        )),
     ];
     let working_dir = env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
     let (session_id, mut output_rx) = match deployment
@@ -804,18 +837,6 @@ async fn handle_ssh_terminal(
                                             );
                                         }
                                         let _ = pty_service.write(session_id, &bytes).await;
-                                        if first_task_submission {
-                                            let notice = "\r\n\x1b[33m[Task AI Platform] AI에게 대화 전용 세션 폴더 생성과 응답 종료 전 새 체크포인트 추가를 요구했습니다.\x1b[0m\r\n";
-                                            let message = TerminalMessage::Output {
-                                                data: BASE64.encode(notice.as_bytes()),
-                                            };
-                                            if let Ok(json) = serde_json::to_string(&message) {
-                                                let _ = socket.send(Message::Text(json.into())).await;
-                                            }
-                                            let _ = pty_service
-                                                .write(session_id, SESSION_START_REMINDER.as_bytes())
-                                                .await;
-                                        }
                                     }
                                 }
                                 TerminalCommand::Resize { cols, rows } => {
@@ -877,8 +898,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        PROGRESS_REMINDER, PROGRESS_REPORT_INTERVAL, SESSION_START_REMINDER, SshLaunchTool,
-        agent_script, is_safe_alias, parse_host_aliases, posix_quote,
+        PROGRESS_REMINDER, PROGRESS_REPORT_INTERVAL, SshLaunchTool, agent_script, is_safe_alias,
+        new_terminal_session_dir, parse_host_aliases, posix_quote, terminal_script,
     };
 
     #[test]
@@ -887,13 +908,28 @@ mod tests {
         assert!(PROGRESS_REMINDER.contains("중간 보고"));
         assert!(PROGRESS_REMINDER.contains("사용자 대화에 직접 보고"));
         assert!(PROGRESS_REMINDER.ends_with('\r'));
-        assert!(SESSION_START_REMINDER.contains("이 대화창만의 sessions/"));
-        assert!(SESSION_START_REMINDER.contains("000001-start.md"));
-        assert!(SESSION_START_REMINDER.contains("기존 체크포인트는 절대 수정·교체·삭제하지 마세요"));
-        assert!(SESSION_START_REMINDER.contains("최종 응답 직전"));
-        assert!(SESSION_START_REMINDER.contains("5분마다 기계적으로 쓰지는"));
-        assert!(SESSION_START_REMINDER.contains("adversarial-code-review-protocol.md"));
-        assert!(SESSION_START_REMINDER.contains("독립 감사관 2명"));
+    }
+
+    #[test]
+    fn allocates_a_unique_immutable_session_directory_for_each_agent_terminal() {
+        let first = new_terminal_session_dir(SshLaunchTool::Claude).unwrap();
+        let second = new_terminal_session_dir(SshLaunchTool::Claude).unwrap();
+        assert_ne!(first, second);
+        assert!(first.starts_with(".ai-room/sessions/"));
+        assert!(first.contains("-claude-"));
+        assert!(new_terminal_session_dir(SshLaunchTool::Shell).is_none());
+
+        let script = terminal_script("/work/project", SshLaunchTool::Claude, Some(&first));
+        assert!(script.contains("while [ \"$room_root\" != / ]"));
+        assert!(script.contains("[ -d \"$room_root/.ai-room/sessions\" ]"));
+        assert!(script.contains("mkdir -- \"$session_dir\""));
+        assert!(script.contains("000001-start.md"));
+        assert!(script.contains("TASK_AI_SESSION_DIR"));
+        assert!(script.contains("exec claude"));
+
+        let plain = terminal_script("/work/project", SshLaunchTool::Claude, None);
+        assert!(!plain.contains("TASK_AI_SESSION_DIR"));
+        assert!(plain.contains("exec claude"));
     }
 
     #[test]

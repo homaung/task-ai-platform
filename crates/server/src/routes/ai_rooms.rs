@@ -42,7 +42,7 @@ const LIBRARY_BASELINE_FILE: &str = ".library-baseline.json";
 const SESSION_OVERRIDES_FILE: &str = "session-overrides.json";
 const DECISIONS_MANAGED_COMMENT: &str =
     "<!-- Task AI Platform가 안정된 AI 작업 기록에서 확정된 결정을 자동 정리합니다. -->";
-const INSTRUCTION_VERSION: i64 = 16;
+const INSTRUCTION_VERSION: i64 = 17;
 const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
 const CLEAR_SEND_ENV: &str = "SendEnv=-*";
 const START_MARKER: &str = "<!-- task-ai-room:start -->";
@@ -443,13 +443,8 @@ pub async fn update_room_profile(
     if let (Some(alias), Some(root)) = (&updated.ssh_alias, &updated.remote_root) {
         let remote = read_remote_files(&updated).await;
         if remote.available
-            && let Err(error) = upgrade_remote_instructions(
-                &updated,
-                alias,
-                root,
-                &remote.files,
-            )
-            .await
+            && let Err(error) =
+                upgrade_remote_instructions(&updated, alias, root, &remote.files).await
         {
             tracing::warn!("AI Room could not push renamed instructions to the server: {error}");
         }
@@ -714,7 +709,7 @@ async fn sync_room_internal(
 ) -> Result<SyncAiRoomResponse, ApiError> {
     let mut local = read_local_files(&room).await;
     let mut copied_to_local = Vec::new();
-    let copied_to_remote = Vec::new();
+    let mut copied_to_remote = Vec::new();
     let removed_from_remote = Vec::new();
     let mut conflicts = Vec::new();
 
@@ -726,23 +721,17 @@ async fn sync_room_internal(
             ));
         }
 
-        let (checkpoint_copies, checkpoint_conflicts) =
+        let (checkpoint_copies, remote_checkpoint_copies, checkpoint_conflicts) =
             sync_remote_checkpoints(&room, &mut local, &remote).await?;
         copied_to_local.extend(checkpoint_copies);
+        copied_to_remote.extend(remote_checkpoint_copies);
         conflicts.extend(checkpoint_conflicts);
 
         // Server rooms are persistent by owner decision (2026-08-06): records
         // stay resident on the server and are never cleaned up automatically.
         // An instruction-upgrade failure must not fail the whole sync — the
         // checkpoint copies above already happened, so report and continue.
-        if let Err(error) = upgrade_remote_instructions(
-            &room,
-            alias,
-            root,
-            &remote.files,
-        )
-        .await
-        {
+        if let Err(error) = upgrade_remote_instructions(&room, alias, root, &remote.files).await {
             tracing::warn!("AI Room could not upgrade server instructions during sync: {error}");
         }
     }
@@ -764,38 +753,41 @@ async fn sync_remote_checkpoints(
     room: &AiRoom,
     local: &mut EndpointFiles,
     remote: &EndpointFiles,
-) -> Result<(Vec<String>, Vec<String>), ApiError> {
+) -> Result<(Vec<String>, Vec<String>, Vec<String>), ApiError> {
     let mut copied = Vec::new();
-    let mut conflicts = Vec::new();
+    let mut copied_to_remote = Vec::new();
+    let (desired_local, desired_remote, mut conflicts) =
+        plan_session_union(&local.files, &remote.files);
+    for filename in &conflicts {
+        if let Some(content) = local.files.get(filename) {
+            preserve_local_version(room, filename, content).await?;
+        }
+    }
 
-    for (filename, content) in remote
-        .files
-        .iter()
-        .filter(|(name, _)| is_session_record_path(name))
-    {
-        match local.files.get(filename) {
-            None => {
-                if create_local_session_record(room, filename, content).await? {
-                    local.files.insert(filename.clone(), content.clone());
-                    copied.push(filename.clone());
-                } else {
-                    let path = safe_room_path(room, filename)?;
-                    let current = fs::read_to_string(path).await?;
-                    local.files.insert(filename.clone(), current.clone());
-                    if current != *content {
-                        conflicts.push(filename.clone());
-                    }
-                }
-            }
-            Some(local_content) if local_content == content => {}
-            Some(local_content) => {
-                // Every session record is immutable, including legacy flat
-                // files. Preserve the local body and surface the divergent
-                // path instead of replacing history in place.
-                preserve_local_version(room, filename, local_content).await?;
-                conflicts.push(filename.clone());
+    for (filename, content) in desired_local {
+        if local.files.get(&filename) == Some(&content) {
+            continue;
+        }
+        if create_local_session_record(room, &filename, &content).await? {
+            local.files.insert(filename.clone(), content);
+            copied.push(filename);
+        } else {
+            let current = fs::read_to_string(safe_room_path(room, &filename)?).await?;
+            local.files.insert(filename.clone(), current.clone());
+            if current != content {
+                conflicts.push(filename);
             }
         }
+    }
+
+    let remote_records = desired_remote.into_iter().collect::<Vec<_>>();
+    if !remote_records.is_empty()
+        && let (Some(alias), Some(root)) = (&room.ssh_alias, &room.remote_root)
+    {
+        let (created, remote_conflicts) =
+            write_remote_session_records(alias, root, &remote_records).await?;
+        copied_to_remote.extend(created);
+        conflicts.extend(remote_conflicts);
     }
 
     // context.md is owner-authored and edited locally; the local copy is
@@ -856,7 +848,9 @@ async fn sync_remote_checkpoints(
         merge_remote_library_documents(room, &mut local.files, &remote.files).await?;
     copied.extend(library_copies);
     conflicts.extend(library_conflicts);
-    Ok((copied, conflicts))
+    conflicts.sort();
+    conflicts.dedup();
+    Ok((copied, copied_to_remote, conflicts))
 }
 
 async fn upgrade_remote_instructions(
@@ -986,7 +980,7 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
 
             // A local root can be temporarily unavailable at app startup
             // (detached drive, network folder, permission prompt). Keep
-            // retrying old registered rooms until the generated v16 files and
+            // retrying old registered rooms until the generated current files and
             // managed AGENTS/CLAUDE blocks are actually installed.
             for room in rooms
                 .iter()
@@ -1052,25 +1046,24 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
                 let _guard = SYNC_LOCK.lock().await;
                 let mut local = read_local_files(&room).await;
                 match sync_remote_checkpoints(&room, &mut local, &remote).await {
-                    Ok((copied, conflicts)) => {
+                    Ok((copied_local, copied_remote, conflicts)) => {
                         if let (Some(alias), Some(root)) = (&room.ssh_alias, &room.remote_root)
-                            && let Err(error) = upgrade_remote_instructions(
-                                &room,
-                                alias,
-                                root,
-                                &remote.files,
-                            )
-                            .await
+                            && let Err(error) =
+                                upgrade_remote_instructions(&room, alias, root, &remote.files).await
                         {
                             tracing::warn!(
                                 "AI Room could not upgrade active server instructions: {error}"
                             );
                         }
-                        if !copied.is_empty() || !conflicts.is_empty() {
+                        if !copied_local.is_empty()
+                            || !copied_remote.is_empty()
+                            || !conflicts.is_empty()
+                        {
                             tracing::info!(
-                                copied = copied.len(),
+                                copied_to_local = copied_local.len(),
+                                copied_to_remote = copied_remote.len(),
                                 conflicts = conflicts.len(),
-                                "AI Room mirrored active server checkpoints without cleanup"
+                                "AI Room reconciled the local and server session union"
                             );
                             // Keep the room list ordered by real activity now
                             // that no automatic path calls sync_room_internal.
@@ -1154,8 +1147,20 @@ fn room_instruction(room: &AiRoom) -> String {
     let instruction = instruction
         .replace("<conversation-id>", "<random-id>")
         .replace(
+            "Give this chat window one unique `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<random-id>/` directory.",
+            "Give this chat window one unique `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<random-id>/` directory. When `TASK_AI_SESSION_DIR` exists, it is the absolute platform-created directory for this launch and you must use exactly that directory. If `/clear`, fork, resume, or another in-process action starts a new conversation, the inherited environment belongs to the previous conversation: create a new random-id directory instead.",
+        )
+        .replace(
+            "Create `000001-start.md` inside it before project work,",
+            "Except after an in-process `/clear`, fork, or resume described above, when `TASK_AI_SESSION_DIR` exists the platform has already created `000001-start.md`; never modify it and create `000002-checkpoint.md` for the first user answer. For an in-process new conversation, treat the inherited variable as stale, create the new random-id directory with its own create-new `000001-start.md`, and use that new path for all later checkpoints. Without that environment variable, create `000001-start.md` yourself before project work,",
+        )
+        .replace(
             "Never use another chat's directory.",
-            "Generate at least 8 random hexadecimal characters for `<random-id>` and, if that directory already exists, generate another. Never use another chat's directory.",
+            "A new chat window or fork is always a new conversation, even when inherited context names an older session directory. Generate at least 8 random hexadecimal characters for `<random-id>` and, if that directory already exists, generate another. Never continue in an inherited directory and never use another chat's directory.",
+        )
+        .replace(
+            "Before each user-facing final response and at meaningful transitions, create the next zero-padded file such as `000002-checkpoint.md`;",
+            "For every user message, before sending the corresponding AI answer, create the next zero-padded file such as `000002-checkpoint.md`; this applies even to short answers, questions, planning, and no-code turns. Also create a checkpoint at meaningful transitions;",
         )
         .replace(
             "Split long-running commands or waits where possible so the reporting interval is not missed; if one operation cannot be interrupted for 5 minutes, warn the user before starting it and report immediately when it returns.",
@@ -1171,7 +1176,7 @@ fn room_instruction(room: &AiRoom) -> String {
         )
         .replace(
             "If `sessions/INDEX.md` documents a local regeneration command, run it before writing that final checkpoint. Add `<!-- task-ai-room:complete -->` as the final line of the final checkpoint only. Never go back to mark an earlier file complete.",
-            "Add `<!-- task-ai-room:complete -->` as that new file's final line. Never go back to mark an earlier file complete. Then regenerate `sessions/INDEX.md` when its documented command exists without modifying the checkpoint.",
+            "The one checkpoint required for this user message is also the final checkpoint; do not create a second file for the same answer. Add `<!-- task-ai-room:complete -->` as that new file's final line. Never go back to mark an earlier file complete. Then regenerate `sessions/INDEX.md` when its documented command exists without modifying the checkpoint.",
         )
         .replace("## Server privacy", "## Server retention and privacy");
     format!(
@@ -1186,8 +1191,20 @@ fn managed_agent_block(room: &AiRoom) -> String {
     )
     .replace("<conversation-id>", "<random-id>")
     .replace(
+        "Give this chat its own unique `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<random-id>/` directory.",
+        "Give this chat its own unique `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<random-id>/` directory. When `TASK_AI_SESSION_DIR` exists, use exactly that absolute platform-created directory. If `/clear`, fork, resume, or another in-process action starts a new conversation, ignore the inherited directory and create a new random-id directory.",
+    )
+    .replace(
+        "Before project work, create `000001-start.md` there",
+        "Before project work, create `000001-start.md` there when `TASK_AI_SESSION_DIR` is absent. Except after an in-process `/clear`, fork, or resume, when it exists the platform already created `000001-start.md`; never modify it and create `000002-checkpoint.md` for the first user answer. For an in-process new conversation, treat the inherited variable as stale, create the new random-id directory with its own create-new `000001-start.md`, and use that new path for every later checkpoint",
+    )
+    .replace(
         "Never use another chat's directory.",
-        "Generate at least 8 random hexadecimal characters for `<random-id>` and, if that directory already exists, generate another. Never use another chat's directory.",
+        "A new chat window or fork is always a new conversation, even when inherited context names an older session directory. Generate at least 8 random hexadecimal characters for `<random-id>` and, if that directory already exists, generate another. Never continue in an inherited directory and never use another chat's directory.",
+    )
+    .replace(
+        "Before every user-facing final response and at meaningful transitions, add the next zero-padded Markdown checkpoint.",
+        "For every user message, before sending the corresponding AI answer, add the next zero-padded Markdown checkpoint; this applies even to short answers, questions, planning, and no-code turns. Also add checkpoints at meaningful transitions.",
     )
     .replace(
         "Warn before an uninterruptible operation that may exceed 5 minutes and report immediately afterward.",
@@ -1199,7 +1216,7 @@ fn managed_agent_block(room: &AiRoom) -> String {
     )
     .replace(
         "regenerate `sessions/INDEX.md` first when its documented command exists, and put the completion marker required by `ROOM.md` on that new file's final line.",
-        "put the completion marker required by `ROOM.md` on that new file's final line. Then regenerate `sessions/INDEX.md` when its documented command exists without modifying the checkpoint.",
+        "use the one checkpoint required for this user message as the final checkpoint; do not create a second file for the same answer. Put the completion marker required by `ROOM.md` on that file's final line. Then regenerate `sessions/INDEX.md` when its documented command exists without modifying the checkpoint.",
     )
     .replace(
         "- Never edit `.ai-room/tasks.md` or `.ai-room/decisions.md`; Task AI Platform derives them.\n\nBefore the final response",
@@ -1294,7 +1311,11 @@ fn owner_working_rules(additional_documents: &[String]) -> String {
     );
     content = content.replace(
         "- 작업 시작 시 대화창마다 고유한 `sessions/YYYYMMDD-HHMMSS-agent-conversation-id/` 폴더를 만들고 첫 체크포인트 파일을 적는다. 다른 대화창의 폴더를 공유하지 않는다.",
-        "- 작업 시작 시 대화창마다 고유한 `sessions/YYYYMMDD-HHMMSS-agent-random-id/` 폴더를 만들고 첫 체크포인트 파일을 적는다. `random-id`는 임의의 16진수 8자 이상이며 이미 존재하는 폴더명은 다시 쓰지 않는다. 다른 대화창의 폴더를 공유하지 않는다.",
+        "- 새 대화창이나 포크를 시작할 때마다 고유한 `sessions/YYYYMMDD-HHMMSS-agent-random-id/` 폴더를 만들고 첫 체크포인트 파일을 적는다. 포크나 같은 프로세스의 `/clear`·resume이 이전 대화의 문맥, 환경변수, 세션 경로를 물려받았더라도 반드시 새 폴더를 만든다. `random-id`는 임의의 16진수 8자 이상이며 이미 존재하는 폴더명은 다시 쓰지 않는다. 다른 대화창의 폴더를 공유하거나 이어 쓰지 않는다.",
+    );
+    content = content.replace(
+        "- 하나의 사용자 대화/AI 응답 단위가 끝나기 전에 같은 폴더에 다음 순번 Markdown 파일을 새로 추가한다. 기존 파일은 수정·교체·이름 변경·삭제하지 않는다.",
+        "- 사용자의 메시지마다 그에 대한 AI 답변을 보내기 전에 같은 폴더에 다음 순번 Markdown 파일을 새로 추가한다. 짧은 답변, 질문, 계획, 코드 변경이 없는 응답도 예외가 아니다. 기존 파일은 수정·교체·이름 변경·삭제하지 않는다.",
     );
     if additional_documents.is_empty() {
         content.push_str("- 현재 발견된 추가 규칙 문서가 없습니다.\n");
@@ -1352,13 +1373,77 @@ fn session_conversation_key(path: &str) -> Option<String> {
     }
 }
 
+fn session_union_copy_path(original: &str, content: &str) -> String {
+    let origin_hash = content_hash(original);
+    let body_hash = content_hash(content);
+    let suffix = format!("{}-{}", &origin_hash[..8], &body_hash[..12]);
+    let relative = original.strip_prefix("sessions/").unwrap_or(original);
+    if let Some((conversation, _)) = relative.split_once('/') {
+        format!("sessions/{conversation}/000000-union-{suffix}.md")
+    } else {
+        format!("sessions/union-{suffix}.md")
+    }
+}
+
+fn plan_session_union(
+    local: &BTreeMap<String, String>,
+    remote: &BTreeMap<String, String>,
+) -> (
+    BTreeMap<String, String>,
+    BTreeMap<String, String>,
+    Vec<String>,
+) {
+    let mut desired_local = BTreeMap::new();
+    let mut desired_remote = BTreeMap::new();
+    let mut conflicts = Vec::new();
+
+    for (filename, local_content) in local
+        .iter()
+        .filter(|(name, _)| is_session_record_path(name))
+    {
+        match remote.get(filename) {
+            None => {
+                desired_remote.insert(filename.clone(), local_content.clone());
+            }
+            Some(remote_content) if remote_content == local_content => {}
+            Some(remote_content) => {
+                conflicts.push(filename.clone());
+                for (path, content) in [
+                    (
+                        session_union_copy_path(filename, local_content),
+                        local_content.clone(),
+                    ),
+                    (
+                        session_union_copy_path(filename, remote_content),
+                        remote_content.clone(),
+                    ),
+                ] {
+                    if local.get(&path) != Some(&content) {
+                        desired_local.insert(path.clone(), content.clone());
+                    }
+                    if remote.get(&path) != Some(&content) {
+                        desired_remote.insert(path, content);
+                    }
+                }
+            }
+        }
+    }
+    for (filename, remote_content) in remote
+        .iter()
+        .filter(|(name, _)| is_session_record_path(name))
+    {
+        if !local.contains_key(filename) {
+            desired_local.insert(filename.clone(), remote_content.clone());
+        }
+    }
+    (desired_local, desired_remote, conflicts)
+}
+
 fn is_session_conversation_path(path: &str) -> bool {
     let Some(relative) = path.strip_prefix("sessions/") else {
         return false;
     };
-    !relative.contains('/')
-        && is_session_component(relative)
-        && !is_session_record_name(relative)
+    !relative.contains('/') && is_session_component(relative) && !is_session_record_name(relative)
 }
 
 fn aggregate_session_records(
@@ -1582,9 +1667,7 @@ async fn cached_local_activity(room: &AiRoom) -> Option<SystemTime> {
 }
 
 async fn session_record_modified(room: &AiRoom, session: &str) -> Option<SystemTime> {
-    let path = PathBuf::from(&room.local_root)
-        .join(ROOM_DIR)
-        .join(session);
+    let path = PathBuf::from(&room.local_root).join(ROOM_DIR).join(session);
     if is_session_record_path(session) {
         return fs::metadata(path)
             .await
@@ -2902,13 +2985,9 @@ async fn prepare_remote(room: &AiRoom, alias: &str, root: &str) -> Result<(), Ap
         .keys()
         .any(|name| is_session_record_path(name))
     {
-        upgrade_remote_instructions(
-            room,
-            alias,
-            root,
-            &existing_remote.files,
-        )
-        .await?;
+        let mut local = local;
+        let _ = sync_remote_checkpoints(room, &mut local, &existing_remote).await?;
+        upgrade_remote_instructions(room, alias, root, &existing_remote.files).await?;
         return Ok(());
     }
 
@@ -3132,6 +3211,59 @@ async fn write_remote_files(
         )));
     }
     Ok(())
+}
+
+async fn write_remote_session_records(
+    alias: &str,
+    root: &str,
+    files: &[(String, String)],
+) -> Result<(Vec<String>, Vec<String>), ApiError> {
+    let mut script = format!(
+        "root={}; room=\"$root/{}\"; mkdir -p \"$room/sessions\" || exit 1;",
+        posix_quote(root),
+        ROOM_DIR
+    );
+    for (index, (relative, content)) in files.iter().enumerate() {
+        if !is_session_record_path(relative) {
+            return Err(ApiError::BadRequest("Invalid session record path".into()));
+        }
+        if content.len() > MAX_DOCUMENT_BYTES {
+            return Err(ApiError::PayloadTooLarge);
+        }
+        let parent = FsPath::new(relative)
+            .parent()
+            .and_then(FsPath::to_str)
+            .ok_or_else(|| ApiError::BadRequest("Invalid session record path".into()))?;
+        let target = format!("$room/{relative}");
+        let temporary = format!("{target}.task-ai-union-$${index}");
+        script.push_str(&format!(
+            " mkdir -p \"$room/{parent}\" || exit 1; printf '%s' {} | base64 -d > \"{temporary}\" || exit 1; if ln \"{temporary}\" \"{target}\" 2>/dev/null; then printf 'A\\t%s\\n' {}; elif cmp -s \"{temporary}\" \"{target}\"; then :; else printf 'C\\t%s\\n' {}; fi; rm -f \"{temporary}\";",
+            posix_quote(&BASE64.encode(content)),
+            posix_quote(relative),
+            posix_quote(relative),
+        ));
+    }
+    let output = run_remote_with_stdin(alias, script.as_bytes()).await?;
+    if !output.status.success() {
+        return Err(ApiError::BadRequest(format!(
+            "Unable to merge session records on {alias}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let mut created = Vec::new();
+    let mut conflicts = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        match line.split_once('\t') {
+            Some(("A", filename)) if is_session_record_path(filename) => {
+                created.push(filename.to_string());
+            }
+            Some(("C", filename)) if is_session_record_path(filename) => {
+                conflicts.push(filename.to_string());
+            }
+            _ => {}
+        }
+    }
+    Ok((created, conflicts))
 }
 
 async fn read_remote_root_file(
@@ -3708,7 +3840,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let room_dir = root.path().join(ROOM_DIR);
         fs::create_dir_all(room_dir.join("sessions")).await.unwrap();
-        fs::create_dir_all(room_dir.join(LIBRARY_DIR)).await.unwrap();
+        fs::create_dir_all(room_dir.join(LIBRARY_DIR))
+            .await
+            .unwrap();
         fs::write(
             room_dir.join("ROOM.md"),
             "# AI Room: old\nInstruction version: 15\nCreate one session file.",
@@ -3739,8 +3873,10 @@ mod tests {
         initialize_local(&room).await.unwrap();
 
         let instruction = fs::read_to_string(room_dir.join("ROOM.md")).await.unwrap();
-        assert!(instruction.contains("Instruction version: 16"));
+        assert!(instruction.contains("Instruction version: 17"));
         assert!(instruction.contains("<random-id>"));
+        assert!(instruction.contains("new chat window or fork"));
+        assert!(instruction.contains("For every user message"));
         assert!(instruction.contains("never edit, replace, rename, or delete"));
         let agents = fs::read_to_string(root.path().join("AGENTS.md"))
             .await
@@ -3780,9 +3916,25 @@ mod tests {
         assert!(room_guide.contains("block reporting for 4 minutes or longer"));
         assert!(room_guide.contains("poll it at intervals of at most 60 seconds"));
         assert!(room_guide.contains("library/owner-working-rules.md"));
-        assert!(room_guide.contains("one unique `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<random-id>/`"));
+        assert!(
+            room_guide
+                .contains("one unique `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<random-id>/`")
+        );
         assert!(room_guide.contains("at least 8 random hexadecimal characters"));
-        assert!(room_guide.contains("never edit, replace, rename, or delete an earlier checkpoint"));
+        assert!(room_guide.contains("new chat window or fork"));
+        assert!(room_guide.contains("For every user message"));
+        assert!(room_guide.contains("short answers, questions, planning, and no-code turns"));
+        assert!(room_guide.contains("TASK_AI_SESSION_DIR"));
+        assert!(room_guide.contains("absolute platform-created directory"));
+        assert!(room_guide.contains("platform has already created `000001-start.md`"));
+        assert!(room_guide.contains("create `000002-checkpoint.md` for the first user answer"));
+        assert!(room_guide.contains("If `/clear`, fork, resume"));
+        assert!(room_guide.contains("treat the inherited variable as stale"));
+        assert!(room_guide.contains("its own create-new `000001-start.md`"));
+        assert!(room_guide.contains("do not create a second file for the same answer"));
+        assert!(
+            room_guide.contains("never edit, replace, rename, or delete an earlier checkpoint")
+        );
         assert!(room_guide.contains(ADVERSARIAL_REVIEW_FILE));
         assert!(room_guide.contains("two independent critics"));
         assert!(agent_guide.contains("visible progress report"));
@@ -3829,6 +3981,9 @@ mod tests {
         );
         let rendered = owner_working_rules(&documents);
         assert!(rendered.contains("진행 보고와 세션 기록은 별개"));
+        assert!(rendered.contains("새 대화창이나 포크"));
+        assert!(rendered.contains("사용자의 메시지마다"));
+        assert!(rendered.contains("짧은 답변, 질문, 계획"));
         assert!(rendered.contains("rules-working-agreement.md"));
         assert!(!rendered.contains("module-ai-cow.md"));
     }
@@ -3960,9 +4115,7 @@ mod tests {
         assert!(!is_session_record_path(
             "sessions/chat-a/nested/000001-start.md"
         ));
-        assert!(!is_session_record_path(
-            "sessions/../000001-start.md"
-        ));
+        assert!(!is_session_record_path("sessions/../000001-start.md"));
         assert_eq!(
             session_status("# Session: example\n\n- Agent: Claude\n- Module: UI\n- Status: 완료\n")
                 .as_deref(),
@@ -4015,8 +4168,65 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(session_status(&conversation.content).as_deref(), Some("완료"));
+        assert_eq!(
+            session_status(&conversation.content).as_deref(),
+            Some("완료")
+        );
         assert!(session_is_complete(&conversation.content));
+    }
+
+    #[test]
+    fn plans_a_bidirectional_session_union_without_overwriting_conflicts() {
+        let local = BTreeMap::from([
+            ("sessions/local-only.md".into(), "local only".into()),
+            ("sessions/same.md".into(), "same".into()),
+            (
+                "sessions/chat-a/000001-start.md".into(),
+                "local divergent".into(),
+            ),
+        ]);
+        let remote = BTreeMap::from([
+            ("sessions/remote-only.md".into(), "remote only".into()),
+            ("sessions/same.md".into(), "same".into()),
+            (
+                "sessions/chat-a/000001-start.md".into(),
+                "remote divergent".into(),
+            ),
+        ]);
+
+        let (to_local, to_remote, conflicts) = plan_session_union(&local, &remote);
+
+        assert_eq!(
+            to_local.get("sessions/remote-only.md").map(String::as_str),
+            Some("remote only")
+        );
+        assert_eq!(
+            to_remote.get("sessions/local-only.md").map(String::as_str),
+            Some("local only")
+        );
+        assert!(!to_local.contains_key("sessions/same.md"));
+        assert!(!to_remote.contains_key("sessions/same.md"));
+        assert_eq!(conflicts, vec!["sessions/chat-a/000001-start.md"]);
+        let local_alias =
+            session_union_copy_path("sessions/chat-a/000001-start.md", "local divergent");
+        let remote_alias =
+            session_union_copy_path("sessions/chat-a/000001-start.md", "remote divergent");
+        assert_eq!(
+            to_local.get(&local_alias),
+            Some(&"local divergent".to_string())
+        );
+        assert_eq!(
+            to_remote.get(&local_alias),
+            Some(&"local divergent".to_string())
+        );
+        assert_eq!(
+            to_local.get(&remote_alias),
+            Some(&"remote divergent".to_string())
+        );
+        assert_eq!(
+            to_remote.get(&remote_alias),
+            Some(&"remote divergent".to_string())
+        );
     }
 
     #[test]
@@ -4360,11 +4570,13 @@ mod tests {
             ..Default::default()
         };
 
-        let (copied, conflicts) = sync_remote_checkpoints(&room, &mut local, &remote)
-            .await
-            .unwrap();
+        let (copied, copied_remote, conflicts) =
+            sync_remote_checkpoints(&room, &mut local, &remote)
+                .await
+                .unwrap();
 
-        assert!(copied.is_empty());
+        assert_eq!(copied.len(), 2);
+        assert!(copied_remote.is_empty());
         assert_eq!(conflicts, vec!["sessions/active.md"]);
         assert_eq!(
             fs::read_to_string(room_dir.join("sessions/active.md"))
@@ -4428,7 +4640,9 @@ mod tests {
         fs::create_dir_all(checkpoint.parent().unwrap())
             .await
             .unwrap();
-        fs::write(&checkpoint, "local immutable body").await.unwrap();
+        fs::write(&checkpoint, "local immutable body")
+            .await
+            .unwrap();
         let room = AiRoom {
             id: Uuid::nil(),
             name: "room".into(),
@@ -4448,13 +4662,18 @@ mod tests {
             ..Default::default()
         };
 
-        let (copied, conflicts) = sync_remote_checkpoints(&room, &mut local, &remote)
-            .await
-            .unwrap();
+        let (copied, copied_remote, conflicts) =
+            sync_remote_checkpoints(&room, &mut local, &remote)
+                .await
+                .unwrap();
 
-        assert!(copied.is_empty());
+        assert_eq!(copied.len(), 2);
+        assert!(copied_remote.is_empty());
         assert_eq!(conflicts, vec![relative]);
-        assert_eq!(fs::read_to_string(checkpoint).await.unwrap(), "local immutable body");
+        assert_eq!(
+            fs::read_to_string(checkpoint).await.unwrap(),
+            "local immutable body"
+        );
     }
 
     #[tokio::test]
@@ -4533,12 +4752,14 @@ mod tests {
             ..Default::default()
         };
 
-        let (copied, conflicts) = sync_remote_checkpoints(&room, &mut local, &remote)
-            .await
-            .unwrap();
+        let (copied, copied_remote, conflicts) =
+            sync_remote_checkpoints(&room, &mut local, &remote)
+                .await
+                .unwrap();
 
         assert_eq!(conflicts, vec!["sessions/active.md"]);
-        assert_eq!(copied.len(), 1);
+        assert!(copied_remote.is_empty());
+        assert_eq!(copied.len(), 3);
         assert_eq!(
             fs::read_to_string(room_dir.join("sessions/active.md"))
                 .await
