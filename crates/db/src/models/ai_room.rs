@@ -38,6 +38,7 @@ pub struct AiRoom {
     pub name: String,
     pub description: Option<String>,
     pub local_root: String,
+    pub workplace_local_root: Option<String>,
     pub ssh_alias: Option<String>,
     pub remote_root: Option<String>,
     pub instruction_version: i64,
@@ -50,6 +51,7 @@ pub struct CreateAiRoom {
     pub name: String,
     pub description: Option<String>,
     pub local_root: String,
+    pub workplace_local_root: Option<String>,
     pub ssh_alias: Option<String>,
     pub remote_root: Option<String>,
     #[serde(default)]
@@ -73,12 +75,13 @@ impl AiRoom {
     pub async fn create(pool: &SqlitePool, data: CreateAiRoom) -> Result<Self, sqlx::Error> {
         let id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO ai_rooms (id, name, description, local_root, ssh_alias, remote_root) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO ai_rooms (id, name, description, local_root, workplace_local_root, ssh_alias, remote_root) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(data.name)
         .bind(data.description)
         .bind(data.local_root)
+        .bind(data.workplace_local_root)
         .bind(data.ssh_alias)
         .bind(data.remote_root)
         .execute(pool)
@@ -134,12 +137,14 @@ impl AiRoom {
     pub async fn update_connection(
         pool: &SqlitePool,
         id: Uuid,
+        workplace_local_root: Option<String>,
         ssh_alias: Option<String>,
         remote_root: Option<String>,
     ) -> Result<Self, sqlx::Error> {
         sqlx::query(
-            "UPDATE ai_rooms SET ssh_alias = ?, remote_root = ?, updated_at = datetime('now', 'subsec') WHERE id = ?",
+            "UPDATE ai_rooms SET workplace_local_root = ?, ssh_alias = ?, remote_root = ?, updated_at = datetime('now', 'subsec') WHERE id = ?",
         )
+        .bind(workplace_local_root)
         .bind(ssh_alias)
         .bind(remote_root)
         .bind(id)

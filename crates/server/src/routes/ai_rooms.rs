@@ -42,7 +42,7 @@ const LIBRARY_BASELINE_FILE: &str = ".library-baseline.json";
 const SESSION_OVERRIDES_FILE: &str = "session-overrides.json";
 const DECISIONS_MANAGED_COMMENT: &str =
     "<!-- Task AI Platform가 안정된 AI 작업 기록에서 확정된 결정을 자동 정리합니다. -->";
-const INSTRUCTION_VERSION: i64 = 17;
+const INSTRUCTION_VERSION: i64 = 18;
 const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
 const CLEAR_SEND_ENV: &str = "SendEnv=-*";
 const START_MARKER: &str = "<!-- task-ai-room:start -->";
@@ -167,6 +167,7 @@ pub struct UpdateAiRoomProfileRequest {
 
 #[derive(Debug, Deserialize, TS)]
 pub struct UpdateAiRoomConnectionRequest {
+    pub workplace_local_root: Option<String>,
     pub ssh_alias: Option<String>,
     pub remote_root: Option<String>,
     #[serde(default)]
@@ -262,15 +263,23 @@ pub async fn create_room(
         ));
     }
 
-    match (&payload.ssh_alias, &payload.remote_root) {
-        (Some(alias), Some(root)) => {
+    payload.workplace_local_root = payload
+        .workplace_local_root
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match (
+        &payload.workplace_local_root,
+        &payload.ssh_alias,
+        &payload.remote_root,
+    ) {
+        (None, Some(alias), Some(root)) => {
             require_registered_alias(alias).await?;
             validate_remote_root(root)?;
         }
-        (None, None) => {}
+        (Some(_), None, None) | (None, None, None) => {}
         _ => {
             return Err(ApiError::BadRequest(
-                "SSH alias and remote root must be configured together".into(),
+                "Choose either one local worksite or one SSH worksite".into(),
             ));
         }
     }
@@ -285,6 +294,14 @@ pub async fn create_room(
         .await
         .map_err(|error| ApiError::BadRequest(format!("Local root is not accessible: {error}")))?;
     payload.local_root = normalized_local_path(&local_root);
+    if let Some(workplace_root) = &payload.workplace_local_root {
+        let workplace_root = canonical_local_workplace(workplace_root).await?;
+        payload.workplace_local_root = if same_local_root(&payload.local_root, &workplace_root) {
+            None
+        } else {
+            Some(workplace_root)
+        };
+    }
 
     if AiRoom::find_all(&deployment.db().pool)
         .await?
@@ -308,6 +325,36 @@ pub async fn create_room(
             return Err(error.into());
         }
     };
+    if let Err(error) = async {
+        initialize_local(&room).await?;
+        if has_distinct_local_workplace(&room) {
+            prepare_local_workplace(&room).await?;
+        }
+        Ok::<(), ApiError>(())
+    }
+    .await
+    {
+        let deleted = AiRoom::delete(&deployment.db().pool, room.id)
+            .await
+            .map_err(|rollback_error| {
+                ApiError::BadRequest(format!(
+                    "Room initialization failed ({error}); the database registration could not be removed, so the local store was preserved: {rollback_error}"
+                ))
+            })?;
+        if !deleted {
+            return Err(ApiError::BadRequest(format!(
+                "Room initialization failed ({error}); the database registration was not removed, so the local store was preserved"
+            )));
+        }
+        if created_root {
+            fs::remove_dir_all(&local_root).await.map_err(|cleanup_error| {
+                ApiError::BadRequest(format!(
+                    "Room initialization failed ({error}); the newly created local store could not be cleaned up: {cleanup_error}"
+                ))
+            })?;
+        }
+        return Err(error);
+    }
     Ok(ResponseJson(ApiResponse::success(room)))
 }
 
@@ -350,6 +397,39 @@ async fn prepare_local_root(path: &FsPath, allow_existing: bool) -> Result<bool,
     Ok(false)
 }
 
+async fn canonical_local_workplace(path: &str) -> Result<String, ApiError> {
+    let path = PathBuf::from(path);
+    let metadata = fs::metadata(&path).await.map_err(|error| {
+        ApiError::BadRequest(format!("Local worksite is not accessible: {error}"))
+    })?;
+    if !metadata.is_dir() {
+        return Err(ApiError::BadRequest(
+            "Local worksite points to a file, not a directory".into(),
+        ));
+    }
+    let canonical = fs::canonicalize(path).await.map_err(|error| {
+        ApiError::BadRequest(format!("Local worksite is not accessible: {error}"))
+    })?;
+    Ok(normalized_local_path(&canonical))
+}
+
+fn local_workplace_root(room: &AiRoom) -> Option<PathBuf> {
+    if room.ssh_alias.is_some() || room.remote_root.is_some() {
+        None
+    } else {
+        Some(PathBuf::from(
+            room.workplace_local_root
+                .as_deref()
+                .unwrap_or(&room.local_root),
+        ))
+    }
+}
+
+fn has_distinct_local_workplace(room: &AiRoom) -> bool {
+    local_workplace_root(room)
+        .is_some_and(|root| !same_local_root(&normalized_local_path(&root), &room.local_root))
+}
+
 fn same_local_root(left: &str, right: &str) -> bool {
     if cfg!(windows) {
         left.eq_ignore_ascii_case(right)
@@ -390,6 +470,9 @@ pub async fn initialize_room(
     let _guard = SYNC_LOCK.lock().await;
     let room = find_room(&deployment, room_id).await?;
     initialize_local(&room).await?;
+    if has_distinct_local_workplace(&room) {
+        prepare_local_workplace(&room).await?;
+    }
     AiRoom::set_instruction_version(&deployment.db().pool, room.id, INSTRUCTION_VERSION).await?;
     let room = find_room(&deployment, room_id).await?;
     Ok(ResponseJson(ApiResponse::success(
@@ -438,6 +521,11 @@ pub async fn update_room_profile(
             "로컬 설명서를 다시 쓰지 못해 변경을 되돌렸습니다: {error}"
         )));
     }
+    if has_distinct_local_workplace(&updated)
+        && let Err(error) = prepare_local_workplace(&updated).await
+    {
+        tracing::warn!("AI Room could not update local worksite instructions: {error}");
+    }
     // Push the renamed instructions to a reachable server right away; the
     // 15-second sync would repair it later anyway via the content diff.
     if let (Some(alias), Some(root)) = (&updated.ssh_alias, &updated.remote_root) {
@@ -461,6 +549,10 @@ pub async fn update_room_connection(
 ) -> Result<ResponseJson<ApiResponse<AiRoomSnapshot>>, ApiError> {
     let _guard = SYNC_LOCK.lock().await;
     let old_room = find_room(&deployment, room_id).await?;
+    let workplace_local_root = payload
+        .workplace_local_root
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let ssh_alias = payload
         .ssh_alias
         .map(|value| value.trim().to_string())
@@ -469,27 +561,36 @@ pub async fn update_room_connection(
         .remote_root
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    match (&ssh_alias, &remote_root) {
-        (Some(alias), Some(root)) => {
+    let workplace_local_root = match (&workplace_local_root, &ssh_alias, &remote_root) {
+        (None, Some(alias), Some(root)) => {
             require_registered_alias(alias).await?;
             validate_remote_root(root)?;
+            None
         }
-        (None, None) => {}
+        (Some(root), None, None) => Some(canonical_local_workplace(root).await?),
+        (None, None, None) => None,
         _ => {
             return Err(ApiError::BadRequest(
-                "SSH alias and remote root must be configured together".into(),
+                "Choose either one local worksite or one SSH worksite".into(),
             ));
         }
-    }
-    if old_room.ssh_alias == ssh_alias && old_room.remote_root == remote_root {
+    };
+    let workplace_local_root =
+        workplace_local_root.filter(|root| !same_local_root(root, &old_room.local_root));
+    if old_room.workplace_local_root == workplace_local_root
+        && old_room.ssh_alias == ssh_alias
+        && old_room.remote_root == remote_root
+    {
         return Ok(ResponseJson(ApiResponse::success(
             build_snapshot(old_room).await,
         )));
     }
 
-    if old_room.ssh_alias.is_some() && old_room.remote_root.is_some() {
-        let old_remote = read_remote_files(&old_room).await;
-        let has_no_active_room = old_remote.error.as_deref() == Some(SERVER_NOT_PREPARED_ERROR);
+    if (old_room.ssh_alias.is_some() && old_room.remote_root.is_some())
+        || has_distinct_local_workplace(&old_room)
+    {
+        let old_workplace = read_workplace_files(&old_room).await;
+        let has_no_active_room = old_workplace.error.as_deref() == Some(SERVER_NOT_PREPARED_ERROR);
         if !has_no_active_room
             && let Err(error) = sync_room_internal(&deployment, old_room.clone()).await
             && !payload.force
@@ -503,17 +604,57 @@ pub async fn update_room_connection(
     let updated = AiRoom::update_connection(
         &deployment.db().pool,
         room_id,
+        workplace_local_root.clone(),
         ssh_alias.clone(),
         remote_root.clone(),
     )
     .await?;
-    initialize_local(&updated).await?;
+    if let Err(error) = initialize_local(&updated).await {
+        let restored = AiRoom::update_connection(
+            &deployment.db().pool,
+            room_id,
+            old_room.workplace_local_root.clone(),
+            old_room.ssh_alias.clone(),
+            old_room.remote_root.clone(),
+        )
+        .await
+        .map_err(|rollback_error| {
+            ApiError::BadRequest(format!(
+                "Failed to update local instructions ({error}) and failed to restore the previous connection: {rollback_error}"
+            ))
+        })?;
+        if let Err(rollback_error) = initialize_local(&restored).await {
+            return Err(ApiError::BadRequest(format!(
+                "Failed to update local instructions ({error}). The database connection was restored, but the local instructions could not be restored: {rollback_error}"
+            )));
+        }
+        return Err(ApiError::BadRequest(format!(
+            "현지 저장소 설명서를 갱신하지 못해 기존 작업장 연결로 되돌렸습니다: {error}"
+        )));
+    }
+    if has_distinct_local_workplace(&updated)
+        && let Err(error) = prepare_local_workplace(&updated).await
+    {
+        let restored = AiRoom::update_connection(
+            &deployment.db().pool,
+            room_id,
+            old_room.workplace_local_root.clone(),
+            old_room.ssh_alias.clone(),
+            old_room.remote_root.clone(),
+        )
+        .await?;
+        let _ = initialize_local(&restored).await;
+        return Err(ApiError::BadRequest(format!(
+            "새 로컬 작업장 준비에 실패해 기존 연결로 되돌렸습니다: {error}"
+        )));
+    }
     if let (Some(alias), Some(root)) = (&ssh_alias, &remote_root)
         && let Err(error) = prepare_remote(&updated, alias, root).await
     {
         let restored = AiRoom::update_connection(
             &deployment.db().pool,
             room_id,
+            old_room.workplace_local_root.clone(),
             old_room.ssh_alias.clone(),
             old_room.remote_root.clone(),
         )
@@ -539,10 +680,11 @@ pub async fn prepare_remote_room(
     Path(room_id): Path<Uuid>,
 ) -> Result<ResponseJson<ApiResponse<AiRoomSnapshot>>, ApiError> {
     let room = find_room(&deployment, room_id).await?;
-    let (Some(alias), Some(root)) = (&room.ssh_alias, &room.remote_root) else {
-        return Err(ApiError::BadRequest("This room has no SSH server".into()));
-    };
-    prepare_remote(&room, alias, root).await?;
+    if let (Some(alias), Some(root)) = (&room.ssh_alias, &room.remote_root) {
+        prepare_remote(&room, alias, root).await?;
+    } else {
+        prepare_local_workplace(&room).await?;
+    }
     AiRoom::touch(&deployment.db().pool, room.id).await?;
     let room = find_room(&deployment, room_id).await?;
     Ok(ResponseJson(ApiResponse::success(
@@ -642,6 +784,14 @@ pub async fn delete_library_file(
 
     if let (Some(alias), Some(root)) = (&room.ssh_alias, &room.remote_root) {
         delete_remote_library_file(alias, root, &filename).await?;
+    } else if has_distinct_local_workplace(&room)
+        && let Some(root) = local_workplace_root(&room)
+    {
+        match fs::remove_file(safe_room_path_at(&root, &relative)?).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
 
     let path = safe_room_path(&room, &relative)?;
@@ -664,18 +814,18 @@ pub async fn import_remote_documents(
 ) -> Result<ResponseJson<ApiResponse<SyncAiRoomResponse>>, ApiError> {
     let _guard = SYNC_LOCK.lock().await;
     let room = find_room(&deployment, room_id).await?;
-    if room.ssh_alias.is_none() || room.remote_root.is_none() {
-        return Err(ApiError::BadRequest("This room has no SSH server".into()));
+    if room.ssh_alias.is_none() && !has_distinct_local_workplace(&room) {
+        return Err(ApiError::BadRequest(
+            "This room has no separate worksite".into(),
+        ));
     }
 
     let mut local = read_local_files(&room).await;
-    let remote = read_remote_files(&room).await;
+    let remote = read_workplace_files(&room).await;
     if !remote.available {
-        return Err(ApiError::BadRequest(
-            remote
-                .error
-                .unwrap_or_else(|| "Server room documents are unavailable".into()),
-        ));
+        return Err(ApiError::BadRequest(remote.error.unwrap_or_else(|| {
+            "Worksite room documents are unavailable".into()
+        })));
     }
 
     let (copied_to_local, conflicts) =
@@ -713,16 +863,20 @@ async fn sync_room_internal(
     let removed_from_remote = Vec::new();
     let mut conflicts = Vec::new();
 
-    if let (Some(alias), Some(root)) = (&room.ssh_alias, &room.remote_root) {
-        let remote = read_remote_files(&room).await;
-        if !remote.available {
-            return Err(ApiError::BadRequest(
-                "Prepare the server before starting an AI session, then sync when it ends".into(),
-            ));
+    if room.ssh_alias.is_some() || has_distinct_local_workplace(&room) {
+        let workplace = read_workplace_files(&room).await;
+        if !workplace.available {
+            return Err(ApiError::BadRequest(workplace.error.unwrap_or_else(|| {
+                "Prepare the worksite before starting an AI session".into()
+            })));
         }
 
         let (checkpoint_copies, remote_checkpoint_copies, checkpoint_conflicts) =
-            sync_remote_checkpoints(&room, &mut local, &remote).await?;
+            if room.ssh_alias.is_some() {
+                sync_remote_checkpoints(&room, &mut local, &workplace).await?
+            } else {
+                sync_local_workplace_checkpoints(&room, &mut local, &workplace).await?
+            };
         copied_to_local.extend(checkpoint_copies);
         copied_to_remote.extend(remote_checkpoint_copies);
         conflicts.extend(checkpoint_conflicts);
@@ -731,8 +885,17 @@ async fn sync_room_internal(
         // stay resident on the server and are never cleaned up automatically.
         // An instruction-upgrade failure must not fail the whole sync — the
         // checkpoint copies above already happened, so report and continue.
-        if let Err(error) = upgrade_remote_instructions(&room, alias, root, &remote.files).await {
-            tracing::warn!("AI Room could not upgrade server instructions during sync: {error}");
+        if let (Some(alias), Some(root)) = (&room.ssh_alias, &room.remote_root)
+            && let Err(error) =
+                upgrade_remote_instructions(&room, alias, root, &workplace.files).await
+        {
+            tracing::warn!(
+                "AI Room could not upgrade SSH worksite instructions during sync: {error}"
+            );
+        } else if has_distinct_local_workplace(&room)
+            && let Err(error) = prepare_local_workplace(&room).await
+        {
+            tracing::warn!("AI Room could not upgrade local worksite instructions: {error}");
         }
     }
 
@@ -747,6 +910,76 @@ async fn sync_room_internal(
         conflicts,
         snapshot,
     })
+}
+
+async fn sync_local_workplace_checkpoints(
+    room: &AiRoom,
+    store: &mut EndpointFiles,
+    workplace: &EndpointFiles,
+) -> Result<(Vec<String>, Vec<String>, Vec<String>), ApiError> {
+    let root = local_workplace_root(room)
+        .filter(|_| has_distinct_local_workplace(room))
+        .ok_or_else(|| ApiError::BadRequest("This room has no distinct local worksite".into()))?;
+    let mut copied_to_store = Vec::new();
+    let mut copied_to_workplace = Vec::new();
+    let (desired_store, desired_workplace, mut conflicts) =
+        plan_session_union(&store.files, &workplace.files);
+
+    for filename in &conflicts {
+        if let Some(content) = store.files.get(filename) {
+            preserve_local_version(room, filename, content).await?;
+        }
+    }
+    for (filename, content) in desired_store {
+        if create_local_session_record(room, &filename, &content).await? {
+            store.files.insert(filename.clone(), content);
+            copied_to_store.push(filename);
+        }
+    }
+    for (filename, content) in desired_workplace {
+        if create_session_record_at(&root, &filename, &content).await? {
+            copied_to_workplace.push(filename);
+        } else {
+            let current = fs::read_to_string(safe_room_path_at(&root, &filename)?).await?;
+            if current != content {
+                conflicts.push(filename);
+            }
+        }
+    }
+
+    let (library_copies, library_conflicts) =
+        merge_remote_library_documents(room, &mut store.files, &workplace.files).await?;
+    copied_to_store.extend(library_copies);
+    conflicts.extend(library_conflicts);
+    for relative in ["context.md", "decisions.md", "tasks.md"] {
+        if let Some(content) = store.files.get(relative)
+            && workplace.files.get(relative) != Some(content)
+        {
+            if let Some(old) = workplace.files.get(relative) {
+                preserve_local_version(room, relative, old).await?;
+            }
+            let path = safe_room_path_at(&root, relative)?;
+            fs::write(path, content).await?;
+            copied_to_workplace.push(relative.into());
+        }
+    }
+    for (relative, content) in store
+        .files
+        .iter()
+        .filter(|(relative, _)| relative.starts_with("library/"))
+    {
+        if workplace.files.get(relative) != Some(content) {
+            let path = safe_room_path_at(&root, relative)?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            fs::write(path, content).await?;
+            copied_to_workplace.push(relative.clone());
+        }
+    }
+    conflicts.sort();
+    conflicts.dedup();
+    Ok((copied_to_store, copied_to_workplace, conflicts))
 }
 
 async fn sync_remote_checkpoints(
@@ -945,6 +1178,13 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
                             room_id = %room.id,
                             "AI Room instructions could not be upgraded: {error}"
                         );
+                    } else if has_distinct_local_workplace(&room)
+                        && let Err(error) = prepare_local_workplace(&room).await
+                    {
+                        tracing::warn!(
+                            room_id = %room.id,
+                            "AI Room local worksite instructions could not be upgraded: {error}"
+                        );
                     } else if let Err(error) = AiRoom::set_instruction_version(
                         &deployment.db().pool,
                         room.id,
@@ -989,6 +1229,15 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
                 let _guard = SYNC_LOCK.lock().await;
                 match initialize_local(room).await {
                     Ok(()) => {
+                        if has_distinct_local_workplace(room)
+                            && let Err(error) = prepare_local_workplace(room).await
+                        {
+                            tracing::warn!(
+                                room_id = %room.id,
+                                "AI Room automatic local worksite upgrade will retry: {error}"
+                            );
+                            continue;
+                        }
                         if let Err(error) = AiRoom::set_instruction_version(
                             &deployment.db().pool,
                             room.id,
@@ -1011,10 +1260,10 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
                 }
             }
 
-            for room in rooms
-                .into_iter()
-                .filter(|room| room.ssh_alias.is_some() && room.remote_root.is_some())
-            {
+            for room in rooms.into_iter().filter(|room| {
+                (room.ssh_alias.is_some() && room.remote_root.is_some())
+                    || has_distinct_local_workplace(room)
+            }) {
                 // Runs before the availability gate so activity on a server
                 // whose temporary room was already cleaned up (or never
                 // prepared) is still observed, and detached so a slow remote
@@ -1024,7 +1273,7 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
                     tokio::spawn(async move { refresh_remote_activity(&room).await });
                 }
 
-                let remote = read_remote_files(&room).await;
+                let remote = read_workplace_files(&room).await;
                 if !remote.available {
                     if remote.error.as_deref() == Some(SERVER_NOT_PREPARED_ERROR)
                         && let (Some(alias), Some(root)) = (&room.ssh_alias, &room.remote_root)
@@ -1039,13 +1288,29 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
                                 "AI Room automatic server preparation will retry: {error}"
                             ),
                         }
+                    } else if has_distinct_local_workplace(&room) {
+                        match prepare_local_workplace(&room).await {
+                            Ok(()) => tracing::info!(
+                                room_id = %room.id,
+                                "AI Room automatically prepared missing local worksite instructions"
+                            ),
+                            Err(error) => tracing::warn!(
+                                room_id = %room.id,
+                                "AI Room automatic local worksite preparation will retry: {error}"
+                            ),
+                        }
                     }
                     continue;
                 }
 
                 let _guard = SYNC_LOCK.lock().await;
                 let mut local = read_local_files(&room).await;
-                match sync_remote_checkpoints(&room, &mut local, &remote).await {
+                let sync_result = if room.ssh_alias.is_some() {
+                    sync_remote_checkpoints(&room, &mut local, &remote).await
+                } else {
+                    sync_local_workplace_checkpoints(&room, &mut local, &remote).await
+                };
+                match sync_result {
                     Ok((copied_local, copied_remote, conflicts)) => {
                         if let (Some(alias), Some(root)) = (&room.ssh_alias, &room.remote_root)
                             && let Err(error) =
@@ -1053,6 +1318,12 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
                         {
                             tracing::warn!(
                                 "AI Room could not upgrade active server instructions: {error}"
+                            );
+                        } else if has_distinct_local_workplace(&room)
+                            && let Err(error) = prepare_local_workplace(&room).await
+                        {
+                            tracing::warn!(
+                                "AI Room could not upgrade active local worksite instructions: {error}"
                             );
                         }
                         if !copied_local.is_empty()
@@ -1063,7 +1334,7 @@ pub fn spawn_auto_sync(deployment: DeploymentImpl) {
                                 copied_to_local = copied_local.len(),
                                 copied_to_remote = copied_remote.len(),
                                 conflicts = conflicts.len(),
-                                "AI Room reconciled the local and server session union"
+                                "AI Room reconciled the local store and worksite session union"
                             );
                             // Keep the room list ordered by real activity now
                             // that no automatic path calls sync_room_internal.
@@ -1141,7 +1412,11 @@ fn room_instruction(room: &AiRoom) -> String {
             .ssh_alias
             .as_ref()
             .zip(room.remote_root.as_ref())
-            .map(|(alias, root)| format!("{alias}:{root}"))
+            .map(|(alias, root)| format!("SSH {alias}:{root}"))
+            .or_else(|| {
+                local_workplace_root(room)
+                    .map(|root| format!("Local {}", normalized_local_path(&root)))
+            })
             .unwrap_or_else(|| "not configured".into()),
     );
     let instruction = instruction
@@ -1177,6 +1452,13 @@ fn room_instruction(room: &AiRoom) -> String {
         .replace(
             "If `sessions/INDEX.md` documents a local regeneration command, run it before writing that final checkpoint. Add `<!-- task-ai-room:complete -->` as the final line of the final checkpoint only. Never go back to mark an earlier file complete.",
             "The one checkpoint required for this user message is also the final checkpoint; do not create a second file for the same answer. Add `<!-- task-ai-room:complete -->` as that new file's final line. Never go back to mark an earlier file complete. Then regenerate `sessions/INDEX.md` when its documented command exists without modifying the checkpoint.",
+        )
+        .replace("## Room endpoints", "## Room topology")
+        .replace("- Local root:", "- Local record store:")
+        .replace("- Remote root:", "- Worksite:")
+        .replace(
+            "The Task AI Platform manages and synchronizes these records. Claude and Codex perform the project work directly in the selected root.",
+            "Task AI Platform keeps the local record store and worksite as a union. Claude and Codex perform project work directly in the worksite. A future cloud store may mirror the local record store without changing the worksite.",
         )
         .replace("## Server privacy", "## Server retention and privacy");
     format!(
@@ -1654,7 +1936,7 @@ async fn cached_local_activity(room: &AiRoom) -> Option<SystemTime> {
             return *latest;
         }
     }
-    let root = PathBuf::from(&room.local_root);
+    let root = local_workplace_root(room)?;
     let latest = tokio::task::spawn_blocking(move || latest_workspace_activity(&root))
         .await
         .ok()
@@ -2920,6 +3202,200 @@ async fn initialize_local(room: &AiRoom) -> Result<(), ApiError> {
     Ok(())
 }
 
+async fn prepare_local_workplace(room: &AiRoom) -> Result<(), ApiError> {
+    let Some(root) = local_workplace_root(room) else {
+        return Err(ApiError::BadRequest(
+            "This room has no local worksite".into(),
+        ));
+    };
+    if !has_distinct_local_workplace(room) {
+        return Ok(());
+    }
+    let metadata = fs::metadata(&root)
+        .await
+        .map_err(|error| ApiError::BadRequest(format!("Local worksite is unavailable: {error}")))?;
+    if !metadata.is_dir() {
+        return Err(ApiError::BadRequest(
+            "Local worksite is not a directory".into(),
+        ));
+    }
+    let room_dir = root.join(ROOM_DIR);
+    let room_dir_metadata = fs::symlink_metadata(&room_dir).await;
+    if let Ok(metadata) = &room_dir_metadata {
+        if metadata.file_type().is_symlink() {
+            return Err(ApiError::BadRequest(
+                "Cannot use a local worksite whose .ai-room folder is a symbolic link".into(),
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(ApiError::Conflict(
+                "Local worksite contains a non-directory .ai-room path".into(),
+            ));
+        }
+    }
+    let identity_path = room_dir.join("room.json");
+    match fs::read_to_string(&identity_path).await {
+        Ok(existing) => {
+            let existing_room_id = serde_json::from_str::<serde_json::Value>(&existing)
+                .ok()
+                .and_then(|value| value.get("room_id")?.as_str().map(str::to_owned));
+            if existing_room_id.as_deref() != Some(&room.id.to_string()) {
+                return Err(ApiError::Conflict(
+                    "Local worksite contains an invalid or differently owned AI Room".into(),
+                ));
+            }
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && room_dir_metadata.is_err() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::Conflict(
+                "Local worksite contains an AI Room without valid ownership metadata".into(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+    for filename in [".gitignore", "AGENTS.md", "CLAUDE.md"] {
+        let path = root.join(filename);
+        if fs::symlink_metadata(&path)
+            .await
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(ApiError::BadRequest(format!(
+                "Cannot install AI Room instructions because worksite {filename} is a symbolic link"
+            )));
+        }
+    }
+    let store = read_local_files(room).await;
+    let mut touched_paths = BTreeSet::from([
+        root.join(".gitignore"),
+        root.join("AGENTS.md"),
+        root.join("CLAUDE.md"),
+        room_dir.join("room.json"),
+        room_dir.join("ROOM.md"),
+    ]);
+    for relative in store.files.keys() {
+        if is_session_record_path(relative)
+            || matches!(
+                relative.as_str(),
+                "ROOM.md" | "context.md" | "decisions.md" | "tasks.md" | SESSION_OVERRIDES_FILE
+            )
+            || relative.starts_with("library/")
+        {
+            touched_paths.insert(safe_room_path_at(&root, relative)?);
+        }
+    }
+    for path in &touched_paths {
+        if path.starts_with(&room_dir) {
+            reject_existing_symlink_components(&room_dir, path).await?;
+        }
+    }
+    let mut backup = Vec::new();
+    for path in touched_paths {
+        let content = match fs::read(&path).await {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        backup.push((path, content));
+    }
+
+    let prepare_result = async {
+        let gitignore_path = root.join(".gitignore");
+        let gitignore = fs::read_to_string(&gitignore_path)
+            .await
+            .unwrap_or_default();
+        let updated_gitignore = ensure_room_gitignore_entry(&gitignore);
+        if updated_gitignore != gitignore {
+            fs::write(gitignore_path, updated_gitignore).await?;
+        }
+
+        fs::create_dir_all(room_dir.join("sessions")).await?;
+        fs::create_dir_all(room_dir.join(LIBRARY_DIR)).await?;
+        for (relative, content) in &store.files {
+            if is_session_record_path(relative) {
+                let _ = create_session_record_at(&root, relative, content).await?;
+            } else if matches!(
+                relative.as_str(),
+                "ROOM.md" | "context.md" | "decisions.md" | "tasks.md" | SESSION_OVERRIDES_FILE
+            ) || relative.starts_with("library/")
+            {
+                let path = safe_room_path_at(&root, relative)?;
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).await?;
+                }
+                if relative == "ROOM.md" || fs::metadata(&path).await.is_err() {
+                    fs::write(path, content).await?;
+                }
+            }
+        }
+        for (relative, content) in initial_files(room) {
+            if relative == "room.json" || relative == "ROOM.md" {
+                fs::write(safe_room_path_at(&root, &relative)?, content).await?;
+            }
+        }
+        let block = managed_agent_block(room);
+        for filename in ["AGENTS.md", "CLAUDE.md"] {
+            let path = root.join(filename);
+            let existing = fs::read_to_string(&path).await.unwrap_or_default();
+            fs::write(path, upsert_managed_block(&existing, &block)).await?;
+        }
+        Ok::<(), ApiError>(())
+    }
+    .await;
+    if let Err(error) = prepare_result {
+        let mut rollback_error = None;
+        for (path, content) in backup.into_iter().rev() {
+            let restored = match content {
+                Some(content) => fs::write(&path, content).await,
+                None => match fs::remove_file(&path).await {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error),
+                },
+            };
+            if let Err(restore_error) = restored {
+                rollback_error.get_or_insert(restore_error);
+            }
+        }
+        for directory in [
+            room_dir.join("sessions"),
+            room_dir.join(LIBRARY_DIR),
+            room_dir,
+        ] {
+            let _ = fs::remove_dir(directory).await;
+        }
+        if let Some(rollback_error) = rollback_error {
+            return Err(ApiError::BadRequest(format!(
+                "Local worksite preparation failed ({error}); restoring the previous worksite files also failed: {rollback_error}"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn reject_existing_symlink_components(base: &FsPath, path: &FsPath) -> Result<(), ApiError> {
+    let relative = path.strip_prefix(base).map_err(|_| {
+        ApiError::BadRequest("AI Room worksite path escapes the managed room directory".into())
+    })?;
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ApiError::BadRequest(format!(
+                    "Cannot prepare a local worksite through symbolic link: {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 async fn discover_owner_rule_documents(room_dir: &FsPath) -> Result<Vec<String>, ApiError> {
     let mut documents = Vec::new();
     let mut entries = fs::read_dir(room_dir.join(LIBRARY_DIR)).await?;
@@ -3075,10 +3551,18 @@ async fn create_local_session_record(
     relative: &str,
     content: &str,
 ) -> Result<bool, ApiError> {
+    create_session_record_at(FsPath::new(&room.local_root), relative, content).await
+}
+
+async fn create_session_record_at(
+    root: &FsPath,
+    relative: &str,
+    content: &str,
+) -> Result<bool, ApiError> {
     if !is_session_record_path(relative) {
         return Err(ApiError::BadRequest("Invalid session record path".into()));
     }
-    let path = safe_room_path(room, relative)?;
+    let path = safe_room_path_at(root, relative)?;
     let parent = path
         .parent()
         .ok_or_else(|| ApiError::BadRequest("Invalid session record path".into()))?;
@@ -3140,6 +3624,10 @@ async fn preserve_local_version(
 }
 
 fn safe_room_path(room: &AiRoom, relative: &str) -> Result<PathBuf, ApiError> {
+    safe_room_path_at(FsPath::new(&room.local_root), relative)
+}
+
+fn safe_room_path_at(root: &FsPath, relative: &str) -> Result<PathBuf, ApiError> {
     if relative.is_empty()
         || relative.contains(['\\', '\0', '\r', '\n'])
         || relative
@@ -3148,9 +3636,7 @@ fn safe_room_path(room: &AiRoom, relative: &str) -> Result<PathBuf, ApiError> {
     {
         return Err(ApiError::BadRequest("Invalid room record path".into()));
     }
-    Ok(PathBuf::from(&room.local_root)
-        .join(ROOM_DIR)
-        .join(relative))
+    Ok(root.join(ROOM_DIR).join(relative))
 }
 
 async fn write_remote_files(
@@ -3331,7 +3817,11 @@ async fn run_remote_with_stdin(
 }
 
 async fn read_local_files(room: &AiRoom) -> EndpointFiles {
-    let room_dir = PathBuf::from(&room.local_root).join(ROOM_DIR);
+    read_local_files_at(FsPath::new(&room.local_root)).await
+}
+
+async fn read_local_files_at(root: &FsPath) -> EndpointFiles {
+    let room_dir = root.join(ROOM_DIR);
     let mut result = EndpointFiles::default();
     if fs::metadata(&room_dir).await.is_err() {
         result.error = Some("Room instructions are not installed locally".into());
@@ -3345,6 +3835,27 @@ async fn read_local_files(room: &AiRoom) -> EndpointFiles {
     }
     if let Ok(content) = fs::read_to_string(room_dir.join(SESSION_OVERRIDES_FILE)).await {
         result.files.insert(SESSION_OVERRIDES_FILE.into(), content);
+    }
+    if let Ok(mut entries) = fs::read_dir(&room_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if valid_library_filename(&name)
+                && !is_reserved_room_filename(&name)
+                && let Ok(file_type) = entry.file_type().await
+                && file_type.is_file()
+                && let Ok(content) = fs::read_to_string(entry.path()).await
+            {
+                if content.len() > MAX_DOCUMENT_BYTES {
+                    result.error.get_or_insert_with(|| {
+                        format!("Room document exceeds the size limit: {name}")
+                    });
+                } else {
+                    result
+                        .files
+                        .insert(format!("root-documents/{name}"), content);
+                }
+            }
+        }
     }
     if let Ok(mut entries) = fs::read_dir(room_dir.join("sessions")).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -3493,6 +4004,16 @@ fi"#,
     result
 }
 
+async fn read_workplace_files(room: &AiRoom) -> EndpointFiles {
+    if room.ssh_alias.is_some() || room.remote_root.is_some() {
+        read_remote_files(room).await
+    } else if let Some(root) = local_workplace_root(room) {
+        read_local_files_at(&root).await
+    } else {
+        EndpointFiles::default()
+    }
+}
+
 fn remote_library_documents(files: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut documents = BTreeMap::new();
     for (filename, content) in files.iter().filter_map(|(name, content)| {
@@ -3512,7 +4033,7 @@ fn remote_library_documents(files: &BTreeMap<String, String>) -> BTreeMap<String
 
 async fn build_snapshot(room: AiRoom) -> AiRoomSnapshot {
     let local = read_local_files(&room).await;
-    let remote = read_remote_files(&room).await;
+    let remote = read_workplace_files(&room).await;
     let (sessions, conflicts) = aggregate_session_records(&local.files, &remote.files);
     let remote_library = remote_library_documents(&remote.files);
     let mut library = Vec::new();
@@ -3627,12 +4148,23 @@ async fn build_snapshot(room: AiRoom) -> AiRoomSnapshot {
         }
         installed
     };
-    let remote_managed = ["AGENTS.md", "CLAUDE.md"].iter().all(|filename| {
-        remote
-            .files
-            .get(&format!("project-root/{filename}"))
-            .is_some_and(|content| content.contains(&managed_block))
-    });
+    let remote_managed = if let Some(root) = local_workplace_root(&room) {
+        let mut installed = true;
+        for filename in ["AGENTS.md", "CLAUDE.md"] {
+            let content = fs::read_to_string(root.join(filename))
+                .await
+                .unwrap_or_default();
+            installed &= content.contains(&managed_block);
+        }
+        installed
+    } else {
+        ["AGENTS.md", "CLAUDE.md"].iter().all(|filename| {
+            remote
+                .files
+                .get(&format!("project-root/{filename}"))
+                .is_some_and(|content| content.contains(&managed_block))
+        })
+    };
     AiRoomSnapshot {
         instruction: value("ROOM.md"),
         context: remote_value("context.md"),
@@ -3652,7 +4184,7 @@ async fn build_snapshot(room: AiRoom) -> AiRoomSnapshot {
             error: local.error,
         },
         remote: AiRoomEndpointState {
-            configured: room.ssh_alias.is_some(),
+            configured: true,
             available: remote.available,
             instruction_installed: remote.files.get("ROOM.md") == Some(&room_instruction(&room))
                 && remote_managed,
@@ -3863,6 +4395,7 @@ mod tests {
             name: "existing room".into(),
             description: None,
             local_root: normalized_local_path(root.path()),
+            workplace_local_root: None,
             ssh_alias: None,
             remote_root: None,
             instruction_version: 15,
@@ -3873,7 +4406,7 @@ mod tests {
         initialize_local(&room).await.unwrap();
 
         let instruction = fs::read_to_string(room_dir.join("ROOM.md")).await.unwrap();
-        assert!(instruction.contains("Instruction version: 17"));
+        assert!(instruction.contains("Instruction version: 18"));
         assert!(instruction.contains("<random-id>"));
         assert!(instruction.contains("new chat window or fork"));
         assert!(instruction.contains("For every user message"));
@@ -3900,6 +4433,7 @@ mod tests {
             name: "room".into(),
             description: None,
             local_root: "C:/work".into(),
+            workplace_local_root: None,
             ssh_alias: None,
             remote_root: None,
             instruction_version: INSTRUCTION_VERSION,
@@ -4039,6 +4573,7 @@ mod tests {
             name: "room".into(),
             description: None,
             local_root: "C:/work".into(),
+            workplace_local_root: None,
             ssh_alias: None,
             remote_root: None,
             instruction_version: 1,
@@ -4070,6 +4605,7 @@ mod tests {
             name: "room".into(),
             description: Some("돼지 데이터 세트 구축 AI를 관리하는 룸".into()),
             local_root: "C:/work".into(),
+            workplace_local_root: None,
             ssh_alias: None,
             remote_root: None,
             instruction_version: INSTRUCTION_VERSION,
@@ -4090,6 +4626,7 @@ mod tests {
             name: "room".into(),
             description: None,
             local_root: "C:/work".into(),
+            workplace_local_root: None,
             ssh_alias: None,
             remote_root: None,
             instruction_version: INSTRUCTION_VERSION,
@@ -4525,6 +5062,7 @@ mod tests {
             name: "room".into(),
             description: None,
             local_root: normalized_local_path(root.path()),
+            workplace_local_root: None,
             ssh_alias: None,
             remote_root: None,
             instruction_version: INSTRUCTION_VERSION,
@@ -4554,6 +5092,7 @@ mod tests {
             name: "room".into(),
             description: None,
             local_root: normalized_local_path(root.path()),
+            workplace_local_root: None,
             ssh_alias: None,
             remote_root: None,
             instruction_version: INSTRUCTION_VERSION,
@@ -4605,6 +5144,7 @@ mod tests {
             name: "room".into(),
             description: None,
             local_root: normalized_local_path(root.path()),
+            workplace_local_root: None,
             ssh_alias: None,
             remote_root: None,
             instruction_version: INSTRUCTION_VERSION,
@@ -4648,6 +5188,7 @@ mod tests {
             name: "room".into(),
             description: None,
             local_root: normalized_local_path(root.path()),
+            workplace_local_root: None,
             ssh_alias: None,
             remote_root: None,
             instruction_version: INSTRUCTION_VERSION,
@@ -4684,6 +5225,7 @@ mod tests {
             name: "room".into(),
             description: None,
             local_root: normalized_local_path(root.path()),
+            workplace_local_root: None,
             ssh_alias: None,
             remote_root: None,
             instruction_version: INSTRUCTION_VERSION,
@@ -4735,6 +5277,7 @@ mod tests {
             name: "room".into(),
             description: None,
             local_root: normalized_local_path(root.path()),
+            workplace_local_root: None,
             ssh_alias: None,
             remote_root: None,
             instruction_version: INSTRUCTION_VERSION,
@@ -4802,5 +5345,111 @@ mod tests {
             .unwrap(),
             "local guide edit"
         );
+    }
+
+    #[tokio::test]
+    async fn local_workplace_sync_keeps_union_on_both_sides() {
+        let store = tempfile::tempdir().unwrap();
+        let workplace = tempfile::tempdir().unwrap();
+        let room = AiRoom {
+            id: Uuid::new_v4(),
+            name: "local workplace".into(),
+            description: None,
+            local_root: normalized_local_path(store.path()),
+            workplace_local_root: Some(normalized_local_path(workplace.path())),
+            ssh_alias: None,
+            remote_root: None,
+            instruction_version: INSTRUCTION_VERSION,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        initialize_local(&room).await.unwrap();
+        create_local_session_record(
+            &room,
+            "sessions/store-chat/000001-start.md",
+            "store session",
+        )
+        .await
+        .unwrap();
+        prepare_local_workplace(&room).await.unwrap();
+        create_session_record_at(
+            workplace.path(),
+            "sessions/work-chat/000001-start.md",
+            "workplace session",
+        )
+        .await
+        .unwrap();
+        fs::write(
+            workplace.path().join(ROOM_DIR).join("RESULTS.md"),
+            "workplace room document",
+        )
+        .await
+        .unwrap();
+
+        let mut store_files = read_local_files(&room).await;
+        let workplace_files = read_workplace_files(&room).await;
+        let (to_store, to_workplace, conflicts) =
+            sync_local_workplace_checkpoints(&room, &mut store_files, &workplace_files)
+                .await
+                .unwrap();
+
+        assert!(conflicts.is_empty());
+        assert!(to_store.contains(&"sessions/work-chat/000001-start.md".to_string()));
+        assert!(to_store.contains(&"library/RESULTS.md".to_string()));
+        assert!(to_workplace.contains(&"library/RESULTS.md".to_string()));
+        for root in [store.path(), workplace.path()] {
+            assert_eq!(
+                fs::read_to_string(
+                    root.join(ROOM_DIR)
+                        .join("sessions/store-chat/000001-start.md")
+                )
+                .await
+                .unwrap(),
+                "store session"
+            );
+            assert_eq!(
+                fs::read_to_string(
+                    root.join(ROOM_DIR)
+                        .join("sessions/work-chat/000001-start.md")
+                )
+                .await
+                .unwrap(),
+                "workplace session"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(store.path().join(ROOM_DIR).join("library/RESULTS.md"))
+                .await
+                .unwrap(),
+            "workplace room document"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_workplace_rejects_unowned_existing_room() {
+        let store = tempfile::tempdir().unwrap();
+        let workplace = tempfile::tempdir().unwrap();
+        fs::create_dir(workplace.path().join(ROOM_DIR))
+            .await
+            .unwrap();
+        fs::write(workplace.path().join(ROOM_DIR).join("room.json"), "{}")
+            .await
+            .unwrap();
+        let room = AiRoom {
+            id: Uuid::new_v4(),
+            name: "local workplace".into(),
+            description: None,
+            local_root: normalized_local_path(store.path()),
+            workplace_local_root: Some(normalized_local_path(workplace.path())),
+            ssh_alias: None,
+            remote_root: None,
+            instruction_version: INSTRUCTION_VERSION,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let error = prepare_local_workplace(&room).await.unwrap_err();
+        assert!(error.to_string().contains("invalid or differently owned"));
     }
 }

@@ -209,6 +209,7 @@ mod migration_tests {
                 name: "local room".into(),
                 description: None,
                 local_root: "C:/work/local-room".into(),
+                workplace_local_root: None,
                 ssh_alias: None,
                 remote_root: None,
                 allow_existing_local_root: false,

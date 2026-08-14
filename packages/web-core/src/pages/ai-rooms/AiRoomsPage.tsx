@@ -129,10 +129,14 @@ export function AiRoomsPage() {
     name: '',
     description: '',
     localRoot: 'C:\\AI-Workspace\\task-ai-platform',
+    workplaceType: 'local' as 'local' | 'ssh',
+    localWorkplaceRoot: 'C:\\AI-Workspace\\task-ai-platform',
     sshAlias: '',
     remoteRoot: '',
   });
   const [connectionForm, setConnectionForm] = useState({
+    workplaceType: 'local' as 'local' | 'ssh',
+    localWorkplaceRoot: '',
     sshAlias: '',
     remoteRoot: '',
     force: false,
@@ -235,6 +239,9 @@ export function AiRoomsPage() {
     if (!snapshot) return;
     void loadHosts().catch((reason) => setError(errorMessage(reason)));
     setConnectionForm({
+      workplaceType: snapshot.room.ssh_alias ? 'ssh' : 'local',
+      localWorkplaceRoot:
+        snapshot.room.workplace_local_root ?? snapshot.room.local_root,
       sshAlias: snapshot.room.ssh_alias ?? '',
       remoteRoot: snapshot.room.remote_root ?? '',
       force: false,
@@ -284,8 +291,18 @@ export function AiRoomsPage() {
     setNotice(null);
     try {
       const next = await aiRoomsApi.updateConnection(selectedRoomId, {
-        ssh_alias: connectionForm.sshAlias || null,
-        remote_root: connectionForm.sshAlias ? connectionForm.remoteRoot : null,
+        workplace_local_root:
+          connectionForm.workplaceType === 'local'
+            ? connectionForm.localWorkplaceRoot
+            : null,
+        ssh_alias:
+          connectionForm.workplaceType === 'ssh'
+            ? connectionForm.sshAlias || null
+            : null,
+        remote_root:
+          connectionForm.workplaceType === 'ssh' && connectionForm.sshAlias
+            ? connectionForm.remoteRoot
+            : null,
         force: connectionForm.force,
       });
       setSnapshot(next);
@@ -293,8 +310,8 @@ export function AiRoomsPage() {
       setShowConnectionEditor(false);
       setNotice(
         next.room.ssh_alias
-          ? '기존 서버 기록을 로컬로 회수하고 새 SSH 서버에 룸 기록과 설명서를 배치했습니다.'
-          : '기존 서버 기록을 로컬로 회수하고 이 룸을 로컬 전용으로 전환했습니다.'
+          ? '기존 작업장 기록을 현지 저장소로 회수하고 새 SSH 작업장에 룸 기록과 설명서를 배치했습니다.'
+          : '기존 작업장 기록을 현지 저장소로 회수하고 로컬 프로젝트를 작업장으로 연결했습니다.'
       );
     } catch (reason) {
       setError(errorMessage(reason));
@@ -316,6 +333,7 @@ export function AiRoomsPage() {
     setNotice(null);
     try {
       const next = await aiRoomsApi.updateConnection(room.id, {
+        workplace_local_root: null,
         ssh_alias: null,
         remote_root: null,
         force: true,
@@ -342,8 +360,13 @@ export function AiRoomsPage() {
         name: form.name,
         description: form.description.trim() || null,
         local_root: form.localRoot,
-        ssh_alias: form.sshAlias || null,
-        remote_root: form.sshAlias ? form.remoteRoot : null,
+        workplace_local_root:
+          form.workplaceType === 'local' ? form.localWorkplaceRoot : null,
+        ssh_alias: form.workplaceType === 'ssh' ? form.sshAlias || null : null,
+        remote_root:
+          form.workplaceType === 'ssh' && form.sshAlias
+            ? form.remoteRoot
+            : null,
         allow_existing_local_root: false,
       };
       let room: AiRoom;
@@ -378,8 +401,8 @@ export function AiRoomsPage() {
       }));
       setNotice(
         room.ssh_alias
-          ? '룸 설명서를 로컬에 설치했습니다. 서버 작업 전에는 서버 작업 준비를 누르세요.'
-          : '룸 설명서를 로컬 프로젝트에 설치했습니다.'
+          ? '룸 설명서를 현지 저장소에 설치했습니다. SSH 작업장도 자동으로 준비합니다.'
+          : '룸 설명서를 현지 저장소와 로컬 작업장에 설치했습니다.'
       );
     } catch (reason) {
       setError(errorMessage(reason));
@@ -412,8 +435,8 @@ export function AiRoomsPage() {
       setSnapshot(result.snapshot);
       setNotice(
         result.conflicts.length
-          ? `합집합 동기화: 로컬에 ${result.copied_to_local.length}개, 서버에 ${result.copied_to_remote.length}개를 추가했습니다. ${result.conflicts.length}개 경로 충돌은 두 내용 모두 별도 기록으로 보존했습니다.`
-          : `합집합 동기화 완료: 로컬에 ${result.copied_to_local.length}개, 서버에 ${result.copied_to_remote.length}개를 추가해 양쪽 세션 기록을 맞췄습니다.`
+          ? `합집합 동기화: 현지 저장소에 ${result.copied_to_local.length}개, 작업장에 ${result.copied_to_remote.length}개를 추가했습니다. ${result.conflicts.length}개 경로 충돌은 두 내용 모두 별도 기록으로 보존했습니다.`
+          : `합집합 동기화 완료: 현지 저장소에 ${result.copied_to_local.length}개, 작업장에 ${result.copied_to_remote.length}개를 추가해 양쪽 세션 기록을 맞췄습니다.`
       );
     } catch (reason) {
       setError(errorMessage(reason));
@@ -434,7 +457,7 @@ export function AiRoomsPage() {
       setNotice(
         result.conflicts.length
           ? `${result.copied_to_local.length}개 문서를 가져왔고 ${result.conflicts.length}개 이름 충돌은 보존했습니다.`
-          : `${result.copied_to_local.length}개 서버 문서를 룸 문서로 가져왔습니다. 서버 원본은 유지됩니다.`
+          : `${result.copied_to_local.length}개 작업장 문서를 룸 문서로 가져왔습니다. 작업장 원본은 유지됩니다.`
       );
     } catch (reason) {
       setError(errorMessage(reason));
@@ -738,7 +761,9 @@ export function AiRoomsPage() {
                 </span>
               </div>
               <p className="mt-1 truncate pl-6 text-xs text-low">
-                {room.ssh_alias ? `${room.ssh_alias} 연결` : '로컬 전용'}
+                {room.ssh_alias
+                  ? `SSH 작업장 · ${room.ssh_alias}`
+                  : '로컬 작업장'}
               </p>
             </button>
           ))}
@@ -832,8 +857,9 @@ export function AiRoomsPage() {
               프로젝트 룸 만들기
             </h2>
             <p className="mt-2 text-sm text-low">
-              같은 프로젝트의 로컬 폴더와 SSH 서버 폴더를 하나의 룸으로
-              연결합니다.
+              기록을 보관할 현지 저장소와 AI가 실제로 일할 작업장을 하나의
+              룸으로 연결합니다. 작업장은 로컬 프로젝트 또는 SSH 프로젝트를
+              선택할 수 있습니다.
             </p>
             {error && (
               <div className="mt-5 rounded-md border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-400">
@@ -868,7 +894,7 @@ export function AiRoomsPage() {
                 />
               </label>
               <label className="block text-sm text-high">
-                로컬 프로젝트 루트
+                현지 저장소
                 <input
                   required
                   value={form.localRoot}
@@ -877,48 +903,96 @@ export function AiRoomsPage() {
                   }
                   className="mt-2 w-full rounded-md border border-border bg-primary px-3 py-2 font-mono text-sm outline-none focus:border-brand"
                 />
+                <span className="mt-1 block text-xs text-low">
+                  모든 룸 기록을 최종 보관하는 이 PC의 폴더입니다.
+                </span>
               </label>
-              <div className="grid gap-4 sm:grid-cols-2">
-                <label className="block text-sm text-high">
-                  SSH 키 별칭 <span className="text-low">(선택)</span>
-                  <select
-                    value={form.sshAlias}
-                    onChange={(event) => void inspectHost(event.target.value)}
-                    className="mt-2 w-full rounded-md border border-border bg-primary px-3 py-2 outline-none focus:border-brand"
-                  >
-                    <option value="">로컬만 사용</option>
-                    {hosts?.hosts.map((host) => (
-                      <option key={host.alias} value={host.alias}>
-                        {host.alias} ({host.hostname})
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="block text-sm text-high">
-                  서버 프로젝트 루트
-                  <input
-                    list="remote-repositories"
-                    required={Boolean(form.sshAlias)}
-                    disabled={!form.sshAlias}
-                    value={form.remoteRoot}
-                    onChange={(event) =>
-                      setForm({ ...form, remoteRoot: event.target.value })
-                    }
-                    className="mt-2 w-full rounded-md border border-border bg-primary px-3 py-2 font-mono text-sm outline-none disabled:opacity-50 focus:border-brand"
-                    placeholder="/home/user/project"
-                  />
-                  <datalist id="remote-repositories">
-                    {connection?.repositories.map((repository) => (
-                      <option key={repository} value={repository} />
-                    ))}
-                  </datalist>
-                </label>
-              </div>
+              <fieldset className="rounded-md border border-border p-4">
+                <legend className="px-2 text-sm font-medium text-high">
+                  작업장
+                </legend>
+                <div className="mb-4 flex gap-4 text-sm text-high">
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="radio"
+                      checked={form.workplaceType === 'local'}
+                      onChange={() =>
+                        setForm({ ...form, workplaceType: 'local' })
+                      }
+                    />
+                    로컬 프로젝트
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="radio"
+                      checked={form.workplaceType === 'ssh'}
+                      onChange={() =>
+                        setForm({ ...form, workplaceType: 'ssh' })
+                      }
+                    />
+                    SSH 프로젝트
+                  </label>
+                </div>
+                {form.workplaceType === 'local' ? (
+                  <label className="block text-sm text-high">
+                    로컬 프로젝트 경로
+                    <input
+                      required
+                      value={form.localWorkplaceRoot}
+                      onChange={(event) =>
+                        setForm({
+                          ...form,
+                          localWorkplaceRoot: event.target.value,
+                        })
+                      }
+                      className="mt-2 w-full rounded-md border border-border bg-primary px-3 py-2 font-mono text-sm outline-none focus:border-brand"
+                    />
+                  </label>
+                ) : (
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <label className="block text-sm text-high">
+                      SSH 키 별칭
+                      <select
+                        value={form.sshAlias}
+                        onChange={(event) =>
+                          void inspectHost(event.target.value)
+                        }
+                        className="mt-2 w-full rounded-md border border-border bg-primary px-3 py-2 outline-none focus:border-brand"
+                      >
+                        <option value="">서버 선택</option>
+                        {hosts?.hosts.map((host) => (
+                          <option key={host.alias} value={host.alias}>
+                            {host.alias} ({host.hostname})
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="block text-sm text-high">
+                      서버 프로젝트 루트
+                      <input
+                        list="remote-repositories"
+                        required={Boolean(form.sshAlias)}
+                        disabled={!form.sshAlias}
+                        value={form.remoteRoot}
+                        onChange={(event) =>
+                          setForm({ ...form, remoteRoot: event.target.value })
+                        }
+                        className="mt-2 w-full rounded-md border border-border bg-primary px-3 py-2 font-mono text-sm outline-none disabled:opacity-50 focus:border-brand"
+                        placeholder="/home/user/project"
+                      />
+                      <datalist id="remote-repositories">
+                        {connection?.repositories.map((repository) => (
+                          <option key={repository} value={repository} />
+                        ))}
+                      </datalist>
+                    </label>
+                  </div>
+                )}
+              </fieldset>
               <div className="rounded-md bg-primary p-3 text-xs leading-5 text-low">
-                생성하면 로컬 프로젝트에 <code>.ai-room</code> 설명서, 룸 문서
-                보관함, 세션 폴더를 만듭니다. 서버 기록은 준비 후 상주하며
-                자동으로 삭제되지 않습니다. 동기화할 때 로컬과 서버 기록의
-                합집합을 만들어 양쪽에 똑같이 보관합니다.
+                현지 저장소와 작업장의 기록은 합집합으로 동기화됩니다. 어느
+                쪽에서 만든 세션도 양쪽에 보존됩니다. 이후 클라우드 저장소는
+                현지 저장소를 그대로 복제하는 별도 계층으로 연결할 수 있습니다.
               </div>
               <div className="flex justify-end gap-2">
                 <button
@@ -962,7 +1036,7 @@ export function AiRoomsPage() {
                   onClick={openConnectionEditor}
                   className="rounded-md border border-border px-3 py-2 text-sm hover:bg-secondary disabled:opacity-50"
                 >
-                  SSH 서버 변경
+                  작업장 변경
                 </button>
                 <button
                   disabled={busy}
@@ -978,8 +1052,8 @@ export function AiRoomsPage() {
                     className="rounded-md border border-border px-3 py-2 text-sm hover:bg-secondary disabled:opacity-50"
                   >
                     {snapshot.remote.instruction_installed
-                      ? '서버 설명서 갱신'
-                      : '서버 작업 준비'}
+                      ? '작업장 설명서 갱신'
+                      : '작업장 준비'}
                   </button>
                 )}
                 <button
@@ -1014,14 +1088,14 @@ export function AiRoomsPage() {
 
             <section className="mt-6 grid gap-3 md:grid-cols-3">
               <EndpointStatus
-                label="로컬"
+                label="현지 저장소"
                 configured={snapshot.local.configured}
                 available={snapshot.local.available}
                 installed={snapshot.local.instruction_installed}
                 detail={snapshot.local.error || snapshot.room.local_root}
               />
               <EndpointStatus
-                label="SSH 서버"
+                label={snapshot.room.ssh_alias ? 'SSH 작업장' : '로컬 작업장'}
                 configured={snapshot.remote.configured}
                 available={snapshot.remote.available}
                 installed={snapshot.remote.instruction_installed}
@@ -1029,7 +1103,8 @@ export function AiRoomsPage() {
                   snapshot.remote.error ||
                   (snapshot.room.ssh_alias && snapshot.room.remote_root
                     ? `${snapshot.room.ssh_alias}:${snapshot.room.remote_root}`
-                    : '연결하지 않음')
+                    : snapshot.room.workplace_local_root ||
+                      snapshot.room.local_root)
                 }
               />
               <div className="rounded-lg border border-border bg-primary p-3">
@@ -1100,7 +1175,7 @@ export function AiRoomsPage() {
                     {snapshot.checkpoint_health.unrecorded_activity &&
                       snapshot.checkpoint_health.remote_activity_age_seconds !=
                         null &&
-                      ` · 서버 작업 활동 ${checkpointAge(snapshot.checkpoint_health.remote_activity_age_seconds)}`}
+                      ` · 작업장 활동 ${checkpointAge(snapshot.checkpoint_health.remote_activity_age_seconds)}`}
                   </p>
                 </div>
               </div>
@@ -1190,10 +1265,10 @@ export function AiRoomsPage() {
               >
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
-                    <h3 className="font-medium text-high">SSH 서버 변경</h3>
+                    <h3 className="font-medium text-high">작업장 변경</h3>
                     <p className="mt-1 text-sm leading-6 text-low">
-                      기존 서버의 최신 세션을 먼저 로컬로 가져온 뒤 새 서버에 룸
-                      기록과 설명서를 자동으로 설치합니다.
+                      기존 작업장의 최신 세션을 먼저 현지 저장소로 가져온 뒤 새
+                      로컬 또는 SSH 작업장에 룸 기록과 설명서를 설치합니다.
                     </p>
                   </div>
                   <button
@@ -1204,48 +1279,93 @@ export function AiRoomsPage() {
                     닫기
                   </button>
                 </div>
-                <div className="mt-4 grid gap-4 sm:grid-cols-2">
-                  <label className="block text-sm text-high">
-                    SSH 서버
-                    <select
-                      value={connectionForm.sshAlias}
-                      onChange={(event) =>
-                        void inspectConnectionHost(event.target.value)
-                      }
-                      className="mt-2 w-full rounded-md border border-border bg-primary px-3 py-2 outline-none focus:border-brand"
-                    >
-                      <option value="">로컬 전용으로 변경</option>
-                      {hosts?.hosts.map((host) => (
-                        <option key={host.alias} value={host.alias}>
-                          {host.alias} ({host.hostname})
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="block text-sm text-high">
-                    새 서버 프로젝트 경로
+                <div className="mt-4 flex gap-4 text-sm text-high">
+                  <label className="flex items-center gap-2">
                     <input
-                      list="connection-remote-repositories"
-                      required={Boolean(connectionForm.sshAlias)}
-                      disabled={!connectionForm.sshAlias}
-                      value={connectionForm.remoteRoot}
+                      type="radio"
+                      checked={connectionForm.workplaceType === 'local'}
+                      onChange={() =>
+                        setConnectionForm((current) => ({
+                          ...current,
+                          workplaceType: 'local',
+                        }))
+                      }
+                    />
+                    로컬 프로젝트
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="radio"
+                      checked={connectionForm.workplaceType === 'ssh'}
+                      onChange={() =>
+                        setConnectionForm((current) => ({
+                          ...current,
+                          workplaceType: 'ssh',
+                        }))
+                      }
+                    />
+                    SSH 프로젝트
+                  </label>
+                </div>
+                {connectionForm.workplaceType === 'local' ? (
+                  <label className="mt-4 block text-sm text-high">
+                    로컬 프로젝트 경로
+                    <input
+                      required
+                      value={connectionForm.localWorkplaceRoot}
                       onChange={(event) =>
                         setConnectionForm((current) => ({
                           ...current,
-                          remoteRoot: event.target.value,
+                          localWorkplaceRoot: event.target.value,
                         }))
                       }
-                      className="mt-2 w-full rounded-md border border-border bg-primary px-3 py-2 font-mono text-sm outline-none disabled:opacity-50 focus:border-brand"
-                      placeholder="/home/user/project"
+                      className="mt-2 w-full rounded-md border border-border bg-primary px-3 py-2 font-mono text-sm outline-none focus:border-brand"
                     />
-                    <datalist id="connection-remote-repositories">
-                      {connection?.repositories.map((repository) => (
-                        <option key={repository} value={repository} />
-                      ))}
-                    </datalist>
                   </label>
-                </div>
-                {snapshot.remote.configured && (
+                ) : (
+                  <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                    <label className="block text-sm text-high">
+                      SSH 서버
+                      <select
+                        value={connectionForm.sshAlias}
+                        onChange={(event) =>
+                          void inspectConnectionHost(event.target.value)
+                        }
+                        className="mt-2 w-full rounded-md border border-border bg-primary px-3 py-2 outline-none focus:border-brand"
+                      >
+                        <option value="">서버 선택</option>
+                        {hosts?.hosts.map((host) => (
+                          <option key={host.alias} value={host.alias}>
+                            {host.alias} ({host.hostname})
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="block text-sm text-high">
+                      새 서버 프로젝트 경로
+                      <input
+                        list="connection-remote-repositories"
+                        required={Boolean(connectionForm.sshAlias)}
+                        disabled={!connectionForm.sshAlias}
+                        value={connectionForm.remoteRoot}
+                        onChange={(event) =>
+                          setConnectionForm((current) => ({
+                            ...current,
+                            remoteRoot: event.target.value,
+                          }))
+                        }
+                        className="mt-2 w-full rounded-md border border-border bg-primary px-3 py-2 font-mono text-sm outline-none disabled:opacity-50 focus:border-brand"
+                        placeholder="/home/user/project"
+                      />
+                      <datalist id="connection-remote-repositories">
+                        {connection?.repositories.map((repository) => (
+                          <option key={repository} value={repository} />
+                        ))}
+                      </datalist>
+                    </label>
+                  </div>
+                )}
+                {snapshot.room.ssh_alias && (
                   <label className="mt-4 flex items-start gap-2 text-xs text-low">
                     <input
                       type="checkbox"
@@ -1258,8 +1378,8 @@ export function AiRoomsPage() {
                       }
                       className="mt-0.5"
                     />
-                    기존 서버에 접속할 수 없어도 로컬에 남은 기록만으로 강제
-                    전환
+                    기존 SSH 작업장에 접속할 수 없어도 현지 저장소 기록만으로
+                    강제 전환
                   </label>
                 )}
                 <div className="mt-5 flex justify-end gap-2">
@@ -1275,7 +1395,7 @@ export function AiRoomsPage() {
                     disabled={busy}
                     className="rounded-md bg-brand px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
                   >
-                    {busy ? '서버 전환 중…' : '기록을 이어서 서버 변경'}
+                    {busy ? '작업장 전환 중…' : '기록을 이어서 작업장 변경'}
                   </button>
                 </div>
               </form>
@@ -1288,10 +1408,10 @@ export function AiRoomsPage() {
                   <h3 className="font-medium text-high">사용 방법</h3>
                   <p className="mt-1 text-sm leading-6 text-low">
                     이 앱에서 채팅하지 않습니다. 로컬에서는 Claude 또는 Codex를
-                    바로 실행하세요. 서버에서 작업할 때는 먼저{' '}
-                    <strong>서버 작업 준비</strong>을 누른 뒤 서버 프로젝트
-                    루트에서 실행합니다. 작업 중 체크포인트는 서버에서 삭제하지
-                    않고 자동으로 로컬에 복사됩니다.{' '}
+                    바로 실행하세요. SSH 작업장에서 작업할 때는 먼저{' '}
+                    <strong>작업장 준비</strong>를 누른 뒤 프로젝트 루트에서
+                    실행합니다. 작업 중 체크포인트는 작업장에서 삭제하지 않고
+                    자동으로 현지 저장소에 복사됩니다.{' '}
                     {snapshot.local_summary_enabled ? (
                       <>
                         2분간 기록이 안정되면 작업 목록과 결정 기록을 로컬 AI가

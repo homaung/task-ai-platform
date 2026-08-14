@@ -10,6 +10,9 @@
     "npx-cli/dist/**"
   ],
   "scripts": {
+    "verify:quick": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/verify-change.ps1 quick",
+    "verify:normal": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/verify-change.ps1 normal",
+    "verify:release": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/verify-change.ps1 release",
     "lint": "pnpm run local-web:lint && pnpm run ui:lint && pnpm run backend:lint && node scripts/check-unused-i18n-keys.mjs",
     "format": "pnpm run backend:format && pnpm run web-core:format && pnpm run local-web:format && pnpm run remote-web:format",
     "check": "pnpm run local-web:legacy-path-guard && pnpm run local-web:check && pnpm run remote-web:check && pnpm run web-core:check && pnpm run ui:check && pnpm run backend:check",

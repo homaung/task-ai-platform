@@ -4,9 +4,9 @@
 
 // If you are an AI, and you absolutely have to edit this file, please confirm with the user first.
 
-export type AiRoom = { id: string, name: string, description: string | null, local_root: string, ssh_alias: string | null, remote_root: string | null, instruction_version: bigint, created_at: string, updated_at: string, };
+export type AiRoom = { id: string, name: string, description: string | null, local_root: string, workplace_local_root: string | null, ssh_alias: string | null, remote_root: string | null, instruction_version: bigint, created_at: string, updated_at: string, };
 
-export type CreateAiRoom = { name: string, description: string | null, local_root: string, ssh_alias: string | null, remote_root: string | null, allow_existing_local_root: boolean, };
+export type CreateAiRoom = { name: string, description: string | null, local_root: string, workplace_local_root: string | null, ssh_alias: string | null, remote_root: string | null, allow_existing_local_root: boolean, };
 
 export type AiRoomStorageMode = "LOCAL_ONLY" | "TASK_AI_CLOUD" | "PERSONAL_HUB";
 
@@ -363,7 +363,7 @@ export type UpdateAiRoomSessionStatusRequest = { filename: string, status: strin
 
 export type UpdateAiRoomProfileRequest = { name: string, description: string | null, };
 
-export type UpdateAiRoomConnectionRequest = { ssh_alias: string | null, remote_root: string | null, force: boolean, };
+export type UpdateAiRoomConnectionRequest = { workplace_local_root: string | null, ssh_alias: string | null, remote_root: string | null, force: boolean, };
 
 export type SyncAiRoomResponse = { copied_to_local: Array<string>, copied_to_remote: Array<string>, removed_from_remote: Array<string>, conflicts: Array<string>, snapshot: AiRoomSnapshot, };
 
