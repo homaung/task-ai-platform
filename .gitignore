@@ -22,6 +22,19 @@ bindings/
 .env.test.local
 .env.production.local
 .env.production
+.env.*
+!.env.example
+!.env.*.example
+
+# Local AI tool state and temporary worktrees
+/.claude/
+/.codex/
+
+# Local logs, scratch files, and editor backups
+*.log
+*.tmp
+*.bak
+*.orig
 
 # IDE
 .vscode/
