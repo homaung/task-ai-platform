@@ -42,7 +42,11 @@ const LIBRARY_BASELINE_FILE: &str = ".library-baseline.json";
 const SESSION_OVERRIDES_FILE: &str = "session-overrides.json";
 const DECISIONS_MANAGED_COMMENT: &str =
     "<!-- Task AI Platform가 안정된 AI 작업 기록에서 확정된 결정을 자동 정리합니다. -->";
-const INSTRUCTION_VERSION: i64 = 19;
+const INSTRUCTION_VERSION: i64 = 21;
+/// Low-cost subagent models the owner chose to write `.ai-room` documents
+/// on behalf of the main agent (GPT/Codex and Claude families).
+const ROOM_WRITER_GPT_MODEL: &str = "gpt-5.6-luna";
+const ROOM_WRITER_CLAUDE_MODEL: &str = "claude-sonnet-5";
 const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
 const CLEAR_SEND_ENV: &str = "SendEnv=-*";
 const START_MARKER: &str = "<!-- task-ai-room:start -->";
@@ -1086,6 +1090,26 @@ async fn sync_remote_checkpoints(
     Ok((copied, copied_to_remote, conflicts))
 }
 
+/// Owner rules pushed to a server always come from the local store, because
+/// sync never pulls them back (see `merge_remote_library_documents`). If the local
+/// copy is missing, rebuild it exactly as `initialize_local` does, including the
+/// room's own rule documents, rather than pushing a bare template over the
+/// server's complete copy.
+async fn local_owner_rules(room: &AiRoom) -> Result<String, ApiError> {
+    let room_dir = PathBuf::from(&room.local_root).join(ROOM_DIR);
+    let path = room_dir.join(OWNER_RULES_FILE);
+    match fs::read_to_string(&path).await {
+        Ok(content) => Ok(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(room_dir.join(LIBRARY_DIR)).await?;
+            let content = owner_working_rules(&discover_owner_rule_documents(&room_dir).await?);
+            fs::write(&path, &content).await?;
+            Ok(content)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn upgrade_remote_instructions(
     room: &AiRoom,
     alias: &str,
@@ -1102,13 +1126,7 @@ async fn upgrade_remote_instructions(
         "instruction_version": INSTRUCTION_VERSION,
     });
     let block = managed_agent_block(room);
-    let owner_rules = fs::read_to_string(
-        PathBuf::from(&room.local_root)
-            .join(ROOM_DIR)
-            .join(OWNER_RULES_FILE),
-    )
-    .await
-    .unwrap_or_else(|_| owner_working_rules(&[]));
+    let owner_rules = local_owner_rules(room).await?;
     let adversarial_review = fs::read_to_string(
         PathBuf::from(&room.local_root)
             .join(ROOM_DIR)
@@ -1397,7 +1415,7 @@ fn normalized_local_path(path: &FsPath) -> String {
 
 fn room_instruction(room: &AiRoom) -> String {
     let instruction = format!(
-        "# AI Room: {name}\n\nRoom ID: `{id}`\nInstruction version: {version}{description}\n\n## Required session workflow\n\n1. Before doing any work, locate the nearest `.ai-room/ROOM.md` by checking the current working directory and then each parent directory. The directory containing that `.ai-room` is the room root. This rule still applies when the AI starts inside a nested module or subfolder. If no ancestor contains it, there is no room for this checkout.\n2. From the room root, read `sessions/INDEX.md` first when it exists, then `.ai-room/context.md`, `.ai-room/decisions.md`, `.ai-room/tasks.md`, relevant files in `.ai-room/library/`, additional Markdown instructions directly under `.ai-room/`, and the newest session records. Read active (`진행중`) rows before choosing files to edit. Resolve every room path from the room root, not from the current subfolder.\n3. Give this chat window one unique `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<conversation-id>/` directory. Never use another chat's directory. Create `000001-start.md` inside it before project work, using this header shape: `# Session: one-line title`, `- Agent: agent name`, `- Module: affected module or area`, `- Status: 진행중`, and `- Started: YYYY-MM-DD HH:MM (timezone)`.\n4. Treat every checkpoint file as immutable. Before each user-facing final response and at meaningful transitions, create the next zero-padded file such as `000002-checkpoint.md`; never edit, replace, rename, or delete an earlier checkpoint. Each new file must repeat the header and preserve the new Goal/checkpoint evidence, decisions with approval state, blockers, changed files, verification, and ordered next steps needed for handoff.\n5. While a user-requested task is still running, send a user-visible progress report when work starts and at least once every 5 minutes of wall-clock time until the final response. A session-file checkpoint does not count as a user report. Each report must state what finished, what is running now, any blocker, and what will happen next. Do not repeat a generic waiting message. Split long-running commands or waits where possible so the reporting interval is not missed; if one operation cannot be interrupted for 5 minutes, warn the user before starting it and report immediately when it returns.\n6. Before editing a file, inspect active sessions for overlapping ownership. Do not edit files claimed by another active AI; create your own conversation directory, link the preceding session when continuing its work, and ask the user to coordinate overlaps. If the user pauses or cancels work, create one final checkpoint with `Status: 중단` or `Status: 보류` and record why.\n7. When the user asks you to remember a reusable method, rule, convention, checklist, prompt, or operating procedure, create or update one focused Markdown file in the room root's `.ai-room/library/`. Use a descriptive filename ending in `.md`, keep one topic per file, and make it understandable without chat history. Do not use the library for transient session notes.\n8. Do not edit `tasks.md` or `decisions.md`. Task AI Platform reads stable session checkpoints together and locally rebuilds both documents. Treat `context.md` as owner-authored and edit it only when explicitly asked.\n9. Never store secrets, tokens, private keys, raw credentials, personal data, or generated binaries in room files.\n10. Before the final response, create the next checkpoint so another AI can continue without chat history. Set its `Status` to exactly one of `완료`, `중단`, or `보류`. If `sessions/INDEX.md` documents a local regeneration command, run it before writing that final checkpoint. Add `{complete_marker}` as the final line of the final checkpoint only. Never go back to mark an earlier file complete.\n\n## Server privacy\n\nWhile work is active, Task AI Platform copies changing server session checkpoints to local storage without deleting the server files. Once every remote session is complete and the merge is conflict-free, it removes the temporary server room. Task and decision summarization uses only the local Ollama service; session contents are not sent to a cloud model.\n\n## Room endpoints\n\n- Local root: `{local}`\n- Remote root: `{remote}`\n\nThe Task AI Platform manages and synchronizes these records. Claude and Codex perform the project work directly in the selected root.\n",
+        "# AI Room: {name}\n\nRoom ID: `{id}`\nInstruction version: {version}{description}\n\n## Room files are subagent-only\n\nThe main agent must never read or write any file inside `.ai-room/` directly, with no exceptions. Every read and every write that the workflow below requires is performed by a subagent: GPT/Codex agents use Luna (`{ROOM_WRITER_GPT_MODEL}`), and Claude agents use Sonnet (`{ROOM_WRITER_CLAUDE_MODEL}`), even when the main agent already runs on that model.\n\n- Reading: the reading subagent follows the reading order below and returns the full text of `ROOM.md`, `library/owner-working-rules.md`, and every rule document those files require, verbatim, plus a factual summary of context, active sessions, the latest handoff, and next steps. It adds no guesses.\n- Writing: the main agent gives the writing subagent the exact path, the required header, and the facts to record (Goal, evidence, decisions with approval state, blockers, changed files, verification, next steps). The subagent writes only that file from those facts, invents nothing, and never edits project files or other room files. Session checkpoints are create-new: it never overwrites an existing checkpoint, including a platform-created `000001-start.md`. It reports the path and the recorded content back.\n- The main agent stays accountable for the record: it confirms from the subagent's report that the file was created, and if the content is wrong it has a subagent add a new corrective checkpoint.\n- Every room rule, including immutable checkpoints, no secrets, never editing `tasks.md` or `decisions.md`, and editing `context.md` only when asked, binds the subagent too.\n- If Luna or Sonnet cannot be selected, use the lowest-cost subagent model available and record which model was used in the checkpoint. If subagents cannot be used at all, do not read or write the room directly: tell the user before starting work and wait for instructions.\n\n## Required session workflow\n\nEvery read or write of a room file in the steps below is performed by the reading or writing subagent defined above, never by the main agent.\n\n1. Before doing any work, locate the nearest `.ai-room/ROOM.md` by checking the current working directory and then each parent directory. The directory containing that `.ai-room` is the room root. This rule still applies when the AI starts inside a nested module or subfolder. If no ancestor contains it, there is no room for this checkout.\n2. From the room root, have the reading subagent read `sessions/INDEX.md` first when it exists, then `.ai-room/context.md`, `.ai-room/decisions.md`, `.ai-room/tasks.md`, relevant files in `.ai-room/library/`, additional Markdown instructions directly under `.ai-room/`, and the newest session records. Read active (`진행중`) rows before choosing files to edit. Resolve every room path from the room root, not from the current subfolder.\n3. Give this chat window one unique `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<conversation-id>/` directory. Never use another chat's directory. Create `000001-start.md` inside it before project work, using this header shape: `# Session: one-line title`, `- Agent: agent name`, `- Module: affected module or area`, `- Status: 진행중`, and `- Started: YYYY-MM-DD HH:MM (timezone)`.\n4. Treat every checkpoint file as immutable. Before each user-facing final response and at meaningful transitions, create the next zero-padded file such as `000002-checkpoint.md`; never edit, replace, rename, or delete an earlier checkpoint. Each new file must repeat the header and preserve the new Goal/checkpoint evidence, decisions with approval state, blockers, changed files, verification, and ordered next steps needed for handoff.\n5. While a user-requested task is still running, send a user-visible progress report when work starts and at least once every 5 minutes of wall-clock time until the final response. A session-file checkpoint does not count as a user report. Each report must state what finished, what is running now, any blocker, and what will happen next. Do not repeat a generic waiting message. Split long-running commands or waits where possible so the reporting interval is not missed; if one operation cannot be interrupted for 5 minutes, warn the user before starting it and report immediately when it returns.\n6. Before editing a file, inspect active sessions for overlapping ownership. Do not edit files claimed by another active AI; create your own conversation directory, link the preceding session when continuing its work, and ask the user to coordinate overlaps. If the user pauses or cancels work, create one final checkpoint with `Status: 중단` or `Status: 보류` and record why.\n7. When the user asks you to remember a reusable method, rule, convention, checklist, prompt, or operating procedure, create or update one focused Markdown file in the room root's `.ai-room/library/`. Use a descriptive filename ending in `.md`, keep one topic per file, and make it understandable without chat history. Do not use the library for transient session notes.\n8. Do not edit `tasks.md` or `decisions.md`. Task AI Platform reads stable session checkpoints together and locally rebuilds both documents. Treat `context.md` as owner-authored and edit it only when explicitly asked.\n9. Never store secrets, tokens, private keys, raw credentials, personal data, or generated binaries in room files.\n10. Before the final response, create the next checkpoint so another AI can continue without chat history. Set its `Status` to exactly one of `완료`, `중단`, or `보류`. If `sessions/INDEX.md` documents a local regeneration command, run it before writing that final checkpoint. Add `{complete_marker}` as the final line of the final checkpoint only. Never go back to mark an earlier file complete.\n\n## Server privacy\n\nWhile work is active, Task AI Platform copies changing server session checkpoints to local storage without deleting the server files. Once every remote session is complete and the merge is conflict-free, it removes the temporary server room. Task and decision summarization uses only the local Ollama service; session contents are not sent to a cloud model.\n\n## Room endpoints\n\n- Local root: `{local}`\n- Remote root: `{remote}`\n\nThe Task AI Platform manages and synchronizes these records. Claude and Codex perform the project work directly in the selected root.\n",
         name = room.name,
         id = room.id,
         version = INSTRUCTION_VERSION,
@@ -1453,6 +1471,10 @@ fn room_instruction(room: &AiRoom) -> String {
             "If `sessions/INDEX.md` documents a local regeneration command, run it before writing that final checkpoint. Add `<!-- task-ai-room:complete -->` as the final line of the final checkpoint only. Never go back to mark an earlier file complete.",
             "The one checkpoint required for this user message is also the final checkpoint; do not create a second file for the same answer. Add `<!-- task-ai-room:complete -->` as that new file's final line. Never go back to mark an earlier file complete. Then regenerate `sessions/INDEX.md` when its documented command exists without modifying the checkpoint.",
         )
+        .replace(
+            "create `000001-start.md` yourself before project work",
+            "have the writing subagent create `000001-start.md` before project work",
+        )
         .replace("## Room endpoints", "## Room topology")
         .replace("- Local root:", "- Local record store:")
         .replace("- Remote root:", "- Worksite:")
@@ -1462,14 +1484,14 @@ fn room_instruction(room: &AiRoom) -> String {
         )
         .replace("## Server privacy", "## Server retention and privacy");
     format!(
-        "{instruction}\n## Mandatory adversarial code review\n\nAfter changing code or executable configuration, read `.ai-room/library/{ADVERSARIAL_REVIEW_NAME}` and apply it before claiming completion. Use two independent critics with different roles and preferably different model families. Let tests, compiler output, static analysis, and reproducible traces outrank model consensus. Record the critics, findings, adjudication evidence, rerun verification, and unresolved risk in the session. This does not apply to answer-only, research-only, planning-only, or prose-only work.\n\n## Record language\n\n- Session checkpoint files may use whichever language lets the active AI preserve technical meaning and handoff context most accurately; they do not need to be Korean.\n- `decisions.md` is shared by the owner and every AI. Task AI Platform renders its explanatory text in Korean and translates session content when necessary. Keep code identifiers, file paths, and product names unchanged when translation would damage their meaning.\n"
+        "{instruction}\n## Mandatory adversarial code review\n\nAfter changing code or executable configuration, have the reading subagent return `.ai-room/library/{ADVERSARIAL_REVIEW_NAME}` verbatim and apply it before claiming completion. Use two independent critics with different roles and preferably different model families. Let tests, compiler output, static analysis, and reproducible traces outrank model consensus. Record the critics, findings, adjudication evidence, rerun verification, and unresolved risk in the session. This does not apply to answer-only, research-only, planning-only, or prose-only work.\n\n## Record language\n\n- Session checkpoint files may use whichever language lets the active AI preserve technical meaning and handoff context most accurately; they do not need to be Korean.\n- `decisions.md` is shared by the owner and every AI. Task AI Platform renders its explanatory text in Korean and translates session content when necessary. Keep code identifiers, file paths, and product names unchanged when translation would damage their meaning.\n"
     )
 }
 
 fn managed_agent_block(room: &AiRoom) -> String {
     let _ = room;
     format!(
-        "{START_MARKER}\n## Shared AI Room — mandatory\n\nBefore analysis or the first project tool call, search from the current working directory upward for the nearest `.ai-room/ROOM.md`. A room located in a parent project root still applies inside a nested module. If found, its workflow is required, not optional documentation.\n\nUse the directory containing `.ai-room` as the room root:\n1. Read `.ai-room/sessions/INDEX.md` first when present, then `ROOM.md` and the room files it requires. Check active (`진행중`) sessions before choosing files to edit.\n2. Give this chat its own unique `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<conversation-id>/` directory. Never use another chat's directory.\n3. Before project work, create `000001-start.md` there with this exact header shape: `# Session: title`, `- Agent: name`, `- Module: area`, `- Status: 진행중`, `- Started: YYYY-MM-DD HH:MM (timezone)`.\n\nDuring work:\n- Before every user-facing final response and at meaningful transitions, add the next zero-padded Markdown checkpoint. Never rewrite, rename, or delete an existing checkpoint.\n- Send the user a visible progress report when work starts and at least every 5 minutes until completion. Session-file writes do not count. State what finished, what is running, blockers, and what comes next; do not repeat generic waiting text. Warn before an uninterruptible operation that may exceed 5 minutes and report immediately afterward.\n- Repeat the discoverable header in every checkpoint and record Goal, checkpoint evidence, decisions and approval state, blockers, failed approaches, changed files, verification, and ordered next steps.\n- Do not edit files claimed by another active session without user coordination.\n- Never edit `.ai-room/tasks.md` or `.ai-room/decisions.md`; Task AI Platform derives them.\n\nBefore the final response, create one final checkpoint with `Status: 완료`, `중단`, or `보류`, regenerate `sessions/INDEX.md` first when its documented command exists, and put the completion marker required by `ROOM.md` on that new file's final line. AI Room records are private runtime data and must never be committed to Git.\n{END_MARKER}"
+        "{START_MARKER}\n## Shared AI Room — mandatory\n\nBefore analysis or the first project tool call, search from the current working directory upward for the nearest `.ai-room/ROOM.md`. A room located in a parent project root still applies inside a nested module. If found, its workflow is required, not optional documentation.\n\nRoom files are subagent-only, with no exceptions: never read or write any file inside `.ai-room/` with the main agent. Every step below that reads or writes a room file is done by a subagent (GPT/Codex: Luna (`{ROOM_WRITER_GPT_MODEL}`); Claude: Sonnet (`{ROOM_WRITER_CLAUDE_MODEL}`)), even when you already run on that model. The reading subagent returns `ROOM.md`, `library/owner-working-rules.md`, and the rule documents they require in full and verbatim, plus a factual summary of everything else. The writing subagent gets the exact path, header, and facts, writes only that file, never overwrites an existing checkpoint, and reports back. If Luna or Sonnet cannot be selected, use the cheapest available subagent and record the model. If subagents are unavailable, do not touch the room yourself: tell the user before starting work. Details: `ROOM.md` section `Room files are subagent-only`.\n\nUse the directory containing `.ai-room` as the room root. Every read or write of a room file below is done by those subagents, never by you:\n1. Have the reading subagent read `.ai-room/sessions/INDEX.md` first when present, then `ROOM.md` and the room files it requires. Check active (`진행중`) sessions before choosing files to edit.\n2. Give this chat its own unique `.ai-room/sessions/YYYYMMDD-HHMMSS-<agent>-<conversation-id>/` directory. Never use another chat's directory.\n3. Before project work, create `000001-start.md` there with this exact header shape: `# Session: title`, `- Agent: name`, `- Module: area`, `- Status: 진행중`, `- Started: YYYY-MM-DD HH:MM (timezone)`.\n\nDuring work:\n- Before every user-facing final response and at meaningful transitions, add the next zero-padded Markdown checkpoint. Never rewrite, rename, or delete an existing checkpoint.\n- Send the user a visible progress report when work starts and at least every 5 minutes until completion. Session-file writes do not count. State what finished, what is running, blockers, and what comes next; do not repeat generic waiting text. Warn before an uninterruptible operation that may exceed 5 minutes and report immediately afterward.\n- Repeat the discoverable header in every checkpoint and record Goal, checkpoint evidence, decisions and approval state, blockers, failed approaches, changed files, verification, and ordered next steps.\n- Do not edit files claimed by another active session without user coordination.\n- Never edit `.ai-room/tasks.md` or `.ai-room/decisions.md`; Task AI Platform derives them.\n\nBefore the final response, create one final checkpoint with `Status: 완료`, `중단`, or `보류`, regenerate `sessions/INDEX.md` first when its documented command exists, and put the completion marker required by `ROOM.md` on that new file's final line. AI Room records are private runtime data and must never be committed to Git.\n{END_MARKER}"
     )
     .replace("<conversation-id>", "<random-id>")
     .replace(
@@ -1502,7 +1524,11 @@ fn managed_agent_block(room: &AiRoom) -> String {
     )
     .replace(
         "- Never edit `.ai-room/tasks.md` or `.ai-room/decisions.md`; Task AI Platform derives them.\n\nBefore the final response",
-        &format!("- Never edit `.ai-room/tasks.md` or `.ai-room/decisions.md`; Task AI Platform derives them.\n- After code or executable-configuration changes, read `.ai-room/library/{ADVERSARIAL_REVIEW_NAME}` and complete its two-independent-critic, evidence-driven review before claiming completion.\n\nBefore the final response"),
+        &format!("- Never edit `.ai-room/tasks.md` or `.ai-room/decisions.md`; Task AI Platform derives them.\n- After code or executable-configuration changes, have the reading subagent return `.ai-room/library/{ADVERSARIAL_REVIEW_NAME}` verbatim and complete its two-independent-critic, evidence-driven review before claiming completion.\n\nBefore the final response"),
+    )
+    .replace(
+        "Before project work, create `000001-start.md` there when",
+        "Before project work, have the writing subagent create `000001-start.md` there when",
     )
 }
 
@@ -1588,8 +1614,8 @@ fn initial_files(room: &AiRoom) -> Vec<(String, String)> {
 }
 
 fn owner_working_rules(additional_documents: &[String]) -> String {
-    let mut content = String::from(
-        "# 프로젝트 소유자의 AI 작업 규칙\n\n이 문서는 사용자가 여러 작업에서 반복해 요구한 방식을 통합한 필수 규칙이다. 모든 AI는 작업을 시작하기 전에 읽고, 프로젝트별 세부 규칙 문서도 함께 따른다.\n\n## 공통 작업 방식\n\n- 사용자의 지시 범위를 임의로 줄이거나 늘리거나 다른 방식으로 대체하지 않는다. 더 나은 방법이나 부수효과가 보이면 코드에 몰래 반영하지 말고 먼저 말한다.\n- 사용자가 만든 설계 문서와 기존 구조를 사양으로 취급한다. 코드를 쓰기 전에 관련 마스터 문서, AI Room 문서, 유사 코드를 읽는다. 구조 변경은 사전에 알리고 승인을 받는다.\n- 사용자가 질문·의견·현실성 검토만 요청한 경우 명시적인 구현 지시 전에는 코딩·설치·실행을 시작하지 않는다.\n- 기본 구현은 장기적으로 유지 가능한 방식을 택한다. 임시방편은 사용자가 명시적으로 요청할 때만 사용한다.\n- 살아 있는 작업 데이터로 테스트하지 않는다. 격리된 사본이나 임시 데이터를 사용하며, 소유하지 않은 세션의 데이터 이동·삭제를 하지 않는다.\n- 커밋·푸시·브랜치 변경 같은 Git 외부 반영은 사용자가 명시적으로 요청한 범위에서만 수행한다. 이미 범위가 명확한 지시를 다시 의심해 시간을 쓰지 않는다.\n- 잘못했을 때 감정적인 사과를 반복하지 말고 원인, 수정 결과, 재발 방지 규칙을 짧게 남긴다.\n- 사용자에게 답변할 때는 항상 존댓말을 사용한다. 사용자가 반말을 쓰더라도 이를 따라 반말로 전환하지 않는다.\n- 사용자를 부를 필요가 있으면 `호명님` 또는 `Homaung`을 사용하고 추측성 호칭을 쓰지 않는다.\n- 사용자는 적녹 색약이므로 빨강과 초록만으로 의미를 구분하지 않는다. 파랑·마젠타·노랑과 모양·문자를 함께 사용한다.\n\n## 코드 변경의 3권 분립 검토\n\n- 코드나 실행 결과에 영향을 주는 설정을 변경하면 완료 응답 전에 [`adversarial-code-review-protocol.md`](adversarial-code-review-protocol.md)를 반드시 적용한다.\n- 메인 구현자와 독립된 기술 감사관·요구사항 감사관이 먼저 서로의 결론을 보지 않고 검토한다.\n- 가능하면 저비용 Codex 계열과 저비용 Claude 계열을 교차 사용한다. 사용할 수 없으면 격리된 두 검토 역할로 대체하고 그 한계를 공개한다.\n- 검토자 간 토론은 충돌한 지적에 대해 한 번만 허용하며, 다수결이나 말의 설득력보다 테스트·컴파일·정적 분석·재현 결과를 우선한다.\n- 확인된 blocker·high·medium 지적을 처리하고 검증을 다시 실행하기 전에는 작업을 완료로 표시하지 않는다.\n\n## 진행 보고와 세션 기록은 별개\n\n- 진행 중에는 사용자 대화에 최대 5분마다 중간 보고한다. 이것은 세션 Markdown 기록 주기가 아니다.\n- 작업 시작 시 대화창마다 고유한 `sessions/YYYYMMDD-HHMMSS-agent-conversation-id/` 폴더를 만들고 첫 체크포인트 파일을 적는다. 다른 대화창의 폴더를 공유하지 않는다.\n- 하나의 사용자 대화/AI 응답 단위가 끝나기 전에 같은 폴더에 다음 순번 Markdown 파일을 새로 추가한다. 기존 파일은 수정·교체·이름 변경·삭제하지 않는다.\n- 세션 파일을 5분마다 기계적으로 만들지 않는다. 사용자에게 보이는 5분 보고와 영속 세션 기록을 서로 대체하지 않는다.\n- 다른 AI의 진행 중 세션과 소유 파일을 먼저 확인하며, 남의 세션 폴더나 파일을 수정하지 않는다.\n\n## 프로젝트별 추가 필수 문서\n\n",
+    let mut content = format!(
+        "# 프로젝트 소유자의 AI 작업 규칙\n\n이 문서는 사용자가 여러 작업에서 반복해 요구한 방식을 통합한 필수 규칙이다. 모든 AI는 작업을 시작하기 전에 읽고, 프로젝트별 세부 규칙 문서도 함께 따른다.\n\n## 공통 작업 방식\n\n- 사용자의 지시 범위를 임의로 줄이거나 늘리거나 다른 방식으로 대체하지 않는다. 더 나은 방법이나 부수효과가 보이면 코드에 몰래 반영하지 말고 먼저 말한다.\n- 사용자가 만든 설계 문서와 기존 구조를 사양으로 취급한다. 코드를 쓰기 전에 관련 마스터 문서, AI Room 문서, 유사 코드를 읽는다. 구조 변경은 사전에 알리고 승인을 받는다.\n- 사용자가 질문·의견·현실성 검토만 요청한 경우 명시적인 구현 지시 전에는 코딩·설치·실행을 시작하지 않는다.\n- 기본 구현은 장기적으로 유지 가능한 방식을 택한다. 임시방편은 사용자가 명시적으로 요청할 때만 사용한다.\n- 살아 있는 작업 데이터로 테스트하지 않는다. 격리된 사본이나 임시 데이터를 사용하며, 소유하지 않은 세션의 데이터 이동·삭제를 하지 않는다.\n- 커밋·푸시·브랜치 변경 같은 Git 외부 반영은 사용자가 명시적으로 요청한 범위에서만 수행한다. 이미 범위가 명확한 지시를 다시 의심해 시간을 쓰지 않는다.\n- 잘못했을 때 감정적인 사과를 반복하지 말고 원인, 수정 결과, 재발 방지 규칙을 짧게 남긴다.\n- 사용자에게 답변할 때는 항상 존댓말을 사용한다. 사용자가 반말을 쓰더라도 이를 따라 반말로 전환하지 않는다.\n- 사용자를 부를 필요가 있으면 `호명님` 또는 `Homaung`을 사용하고 추측성 호칭을 쓰지 않는다.\n- 사용자는 적녹 색약이므로 빨강과 초록만으로 의미를 구분하지 않는다. 파랑·마젠타·노랑과 모양·문자를 함께 사용한다.\n\n## 코드 변경의 3권 분립 검토\n\n- 코드나 실행 결과에 영향을 주는 설정을 변경하면 완료 응답 전에 [`adversarial-code-review-protocol.md`](adversarial-code-review-protocol.md)를 반드시 적용한다.\n- 메인 구현자와 독립된 기술 감사관·요구사항 감사관이 먼저 서로의 결론을 보지 않고 검토한다.\n- 가능하면 저비용 Codex 계열과 저비용 Claude 계열을 교차 사용한다. 사용할 수 없으면 격리된 두 검토 역할로 대체하고 그 한계를 공개한다.\n- 검토자 간 토론은 충돌한 지적에 대해 한 번만 허용하며, 다수결이나 말의 설득력보다 테스트·컴파일·정적 분석·재현 결과를 우선한다.\n- 확인된 blocker·high·medium 지적을 처리하고 검증을 다시 실행하기 전에는 작업을 완료로 표시하지 않는다.\n\n## 진행 보고와 세션 기록은 별개\n\n- 진행 중에는 사용자 대화에 최대 5분마다 중간 보고한다. 이것은 세션 Markdown 기록 주기가 아니다.\n- 작업 시작 시 대화창마다 고유한 `sessions/YYYYMMDD-HHMMSS-agent-conversation-id/` 폴더를 만들고 첫 체크포인트 파일을 적는다. 다른 대화창의 폴더를 공유하지 않는다.\n- 하나의 사용자 대화/AI 응답 단위가 끝나기 전에 같은 폴더에 다음 순번 Markdown 파일을 새로 추가한다. 기존 파일은 수정·교체·이름 변경·삭제하지 않는다.\n- 세션 파일을 5분마다 기계적으로 만들지 않는다. 사용자에게 보이는 5분 보고와 영속 세션 기록을 서로 대체하지 않는다.\n- 다른 AI의 진행 중 세션과 소유 파일을 먼저 확인하며, 남의 세션 폴더나 파일을 수정하지 않는다.\n\n## 룸 문서 읽기·쓰기는 하위 에이전트 전담\n\n- 메인 AI는 `.ai-room` 안의 어떤 문서도 직접 읽거나 쓰지 않는다. 예외 없이 모든 읽기와 쓰기는 하위 에이전트가 한다. GPT·Codex 계열은 Luna(`{ROOM_WRITER_GPT_MODEL}`), Claude 계열은 Sonnet(`{ROOM_WRITER_CLAUDE_MODEL}`)을 사용하며, 메인 AI가 이미 그 모델로 실행 중이어도 하위 에이전트에게 맡긴다.\n- 읽기: 하위 에이전트는 룸 규칙이 정한 순서로 읽고, `ROOM.md`, `library/owner-working-rules.md`와 이 문서들이 요구하는 규칙 문서는 전문을 원문 그대로, 맥락·진행 중 세션·최근 인수인계·다음 단계는 사실만 요약해 메인 AI에게 돌려준다. 추측을 섞지 않는다.\n- 쓰기: 메인 AI는 정확한 파일 경로, 필수 헤더, 기록할 사실(목표·근거·결정과 승인 상태·막힌 점·변경 파일·검증·다음 단계)을 넘긴다. 하위 에이전트는 받은 내용만 그 파일 하나에 쓰고, 사실을 지어내거나 프로젝트 파일·다른 룸 파일을 수정하지 않는다. 세션 체크포인트는 새 파일로만 만들며, 플랫폼이 만든 `000001-start.md`를 포함해 이미 있는 체크포인트를 덮어쓰지 않는다. 쓴 뒤 파일 경로와 기록한 내용을 메인 AI에게 보고한다.\n- 기록 책임은 메인 AI에게 있다. 하위 에이전트의 보고로 파일이 만들어졌는지 확인하고, 내용이 틀렸으면 하위 에이전트에게 바로잡는 새 체크포인트를 쓰게 한다.\n- 체크포인트 불변, 비밀정보 금지, `tasks.md`·`decisions.md` 편집 금지, `context.md`는 요청 시에만 수정 등 기존 룸 규칙은 하위 에이전트에도 그대로 적용된다.\n- Luna·Sonnet을 지정할 수 없으면 그 환경에서 쓸 수 있는 가장 저렴한 하위 에이전트를 쓰고 사용한 모델을 체크포인트에 남긴다. 하위 에이전트 자체를 쓸 수 없으면 룸을 직접 읽거나 쓰지 말고, 작업을 시작하기 전에 사용자에게 알리고 지시를 받는다.\n\n## 프로젝트별 추가 필수 문서\n\n",
     );
     content = content.replace(
         "\n\n## 코드 변경의 3권 분립 검토",
@@ -2084,6 +2110,13 @@ async fn merge_remote_library_documents(
     let conflicts = Vec::new();
 
     for (filename, remote_content) in &remote_documents {
+        // Task AI Platform regenerates the owner rules from its template on every
+        // upgrade, so the local copy is authoritative and is pushed to the server by
+        // `upgrade_remote_instructions`. Pulling an older server copy back would
+        // overwrite each upgrade before it could ever reach the server.
+        if filename == OWNER_RULES_FILE {
+            continue;
+        }
         match local_files.get(filename) {
             None => {
                 write_local_file(room, &filename, remote_content).await?;
@@ -4412,7 +4445,19 @@ mod tests {
         initialize_local(&room).await.unwrap();
 
         let instruction = fs::read_to_string(room_dir.join("ROOM.md")).await.unwrap();
-        assert!(instruction.contains("Instruction version: 19"));
+        assert!(instruction.contains("Instruction version: 21"));
+        assert!(instruction.contains("## Room files are subagent-only"));
+        assert!(instruction.contains("never read or write any file inside `.ai-room/` directly"));
+        assert!(instruction.contains(&format!("Luna (`{ROOM_WRITER_GPT_MODEL}`)")));
+        assert!(instruction.contains(&format!("Sonnet (`{ROOM_WRITER_CLAUDE_MODEL}`)")));
+        assert!(instruction.contains("never overwrites an existing checkpoint"));
+        assert!(instruction.contains("have the writing subagent create `000001-start.md`"));
+        assert!(!instruction.contains("create `000001-start.md` yourself"));
+        // Agents must learn the rule before the workflow tells them to read anything.
+        assert!(
+            instruction.find("## Room files are subagent-only").unwrap()
+                < instruction.find("## Required session workflow").unwrap()
+        );
         assert!(instruction.contains("<random-id>"));
         assert!(instruction.contains("new chat window or fork"));
         assert!(instruction.contains("For every user message"));
@@ -4430,6 +4475,16 @@ mod tests {
         assert!(owner_rules.contains("`find /`, 전체 `du`"));
         assert!(owner_rules.contains("`find <path> -maxdepth 3 -mtime -7`"));
         assert!(owner_rules.contains("작업에 필요한 하위 경로만 사용한다"));
+        assert!(owner_rules.contains("## 룸 문서 읽기·쓰기는 하위 에이전트 전담"));
+        assert!(owner_rules.contains(&format!("Luna(`{ROOM_WRITER_GPT_MODEL}`)")));
+        assert!(owner_rules.contains(&format!("Sonnet(`{ROOM_WRITER_CLAUDE_MODEL}`)")));
+        assert!(
+            owner_rules.contains("메인 AI가 이미 그 모델로 실행 중이어도 하위 에이전트에게 맡긴다")
+        );
+        assert!(owner_rules.contains("이미 있는 체크포인트를 덮어쓰지 않는다"));
+        assert!(owner_rules.contains("전문을 원문 그대로"));
+        assert!(owner_rules.contains("작업을 시작하기 전에 사용자에게 알리고 지시를 받는다"));
+        assert!(agents.contains("Room files are subagent-only"));
         assert_eq!(agents.matches(START_MARKER).count(), 1);
         assert_eq!(
             fs::read_to_string(room_dir.join("sessions/legacy.md"))
@@ -4492,10 +4547,46 @@ mod tests {
         assert!(agent_guide.contains("Never rewrite, rename, or delete an existing checkpoint"));
         assert!(agent_guide.contains(ADVERSARIAL_REVIEW_FILE));
         assert!(agent_guide.contains("two-independent-critic"));
+        // The owner chose these subagent models explicitly; changing them is a rule change.
+        assert_eq!(ROOM_WRITER_GPT_MODEL, "gpt-5.6-luna");
+        assert_eq!(ROOM_WRITER_CLAUDE_MODEL, "claude-sonnet-5");
+        assert!(room_guide.contains("even when the main agent already runs on that model"));
+        assert!(
+            room_guide.contains("tell the user before starting work and wait for instructions")
+        );
+        assert!(room_guide.contains("returns the full text of `ROOM.md`"));
+        assert!(room_guide.contains("have the reading subagent read `sessions/INDEX.md` first"));
+        assert!(room_guide.contains("never by the main agent"));
+        assert!(room_guide.contains("have the reading subagent return `.ai-room/library/"));
+        assert!(
+            agent_guide.contains("Have the reading subagent read `.ai-room/sessions/INDEX.md`")
+        );
+        assert!(
+            agent_guide.contains("have the writing subagent create `000001-start.md` there when")
+        );
+        assert!(!agent_guide.contains("Before project work, create `000001-start.md`"));
+        assert!(agent_guide.contains("have the reading subagent return `.ai-room/library/"));
+        assert!(agent_guide.contains("never by you"));
+        assert!(
+            agent_guide
+                .contains("never read or write any file inside `.ai-room/` with the main agent")
+        );
+        assert!(agent_guide.contains(&format!("Luna (`{ROOM_WRITER_GPT_MODEL}`)")));
+        assert!(agent_guide.contains(&format!("Sonnet (`{ROOM_WRITER_CLAUDE_MODEL}`)")));
+        assert!(agent_guide.contains("never overwrites an existing checkpoint"));
+        assert!(agent_guide.contains("do not touch the room yourself"));
+        // The rule opens the managed block, ahead of any reading step, and stays inside it
+        // so owner text around the block is untouched.
+        let rule = agent_guide.find("Room files are subagent-only").unwrap();
+        assert!(agent_guide.find(START_MARKER).unwrap() < rule);
+        assert!(rule < agent_guide.find("Use the directory containing").unwrap());
+        assert!(rule < agent_guide.find(END_MARKER).unwrap());
 
         let initial = initial_files(&room);
         assert!(initial.iter().any(|(name, content)| {
-            name == OWNER_RULES_FILE && content.contains("프로젝트 소유자의 AI 작업 규칙")
+            name == OWNER_RULES_FILE
+                && content.contains("프로젝트 소유자의 AI 작업 규칙")
+                && content.contains("## 룸 문서 읽기·쓰기는 하위 에이전트 전담")
         }));
         assert!(initial.iter().any(|(name, content)| {
             name == ADVERSARIAL_REVIEW_FILE && content.contains("3권 분립형 적대 코드 검토 규약")
@@ -5055,6 +5146,118 @@ mod tests {
         assert!(is_reserved_room_filename("context.md"));
         assert!(is_reserved_room_filename("ROOM.md"));
         assert!(!is_reserved_room_filename("deploy-notes.md"));
+    }
+
+    #[tokio::test]
+    async fn missing_local_owner_rules_are_rebuilt_with_room_documents() {
+        let root = tempfile::tempdir().unwrap();
+        let room = AiRoom {
+            id: Uuid::nil(),
+            name: "room".into(),
+            description: None,
+            local_root: normalized_local_path(root.path()),
+            workplace_local_root: None,
+            ssh_alias: None,
+            remote_root: None,
+            instruction_version: INSTRUCTION_VERSION,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        initialize_local(&room).await.unwrap();
+        let room_dir = root.path().join(ROOM_DIR);
+        fs::write(
+            room_dir
+                .join(LIBRARY_DIR)
+                .join("rules-working-agreement.md"),
+            "# Agreement",
+        )
+        .await
+        .unwrap();
+        fs::remove_file(room_dir.join(OWNER_RULES_FILE))
+            .await
+            .unwrap();
+
+        let rebuilt = local_owner_rules(&room).await.unwrap();
+
+        assert!(rebuilt.contains("## 룸 문서 읽기·쓰기는 하위 에이전트 전담"));
+        // Unlike the bare template, the rebuilt rules keep the room's own documents,
+        // so a deleted local copy can no longer strip them from the server.
+        assert!(rebuilt.contains("rules-working-agreement.md"));
+        assert_ne!(rebuilt, owner_working_rules(&[]));
+        assert_eq!(
+            fs::read_to_string(room_dir.join(OWNER_RULES_FILE))
+                .await
+                .unwrap(),
+            rebuilt
+        );
+        // An existing local copy is returned as-is.
+        fs::write(room_dir.join(OWNER_RULES_FILE), "local edition")
+            .await
+            .unwrap();
+        assert_eq!(local_owner_rules(&room).await.unwrap(), "local edition");
+    }
+
+    #[tokio::test]
+    async fn server_copy_never_reverts_generated_owner_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let room = AiRoom {
+            id: Uuid::nil(),
+            name: "room".into(),
+            description: None,
+            local_root: normalized_local_path(root.path()),
+            workplace_local_root: None,
+            ssh_alias: None,
+            remote_root: None,
+            instruction_version: INSTRUCTION_VERSION,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        initialize_local(&room).await.unwrap();
+        let room_dir = root.path().join(ROOM_DIR);
+        let generated = fs::read_to_string(room_dir.join(OWNER_RULES_FILE))
+            .await
+            .unwrap();
+        assert!(generated.contains("## 룸 문서 읽기·쓰기는 하위 에이전트 전담"));
+
+        let mut local = read_local_files(&room).await;
+        assert_eq!(local.files.get(OWNER_RULES_FILE), Some(&generated));
+        let mut remote = BTreeMap::new();
+        remote.insert(
+            OWNER_RULES_FILE.to_string(),
+            "# outdated server owner rules".to_string(),
+        );
+        remote.insert(
+            "root-documents/owner-working-rules.md".to_string(),
+            "# outdated root owner rules".to_string(),
+        );
+        remote.insert(
+            "library/server-method.md".to_string(),
+            "# Server method".to_string(),
+        );
+
+        let (copied, conflicts) = merge_remote_library_documents(&room, &mut local.files, &remote)
+            .await
+            .unwrap();
+
+        // The regenerated rules survive on disk and in memory, so the upgrade step
+        // pushes the new version to the server instead of reading the old one back.
+        assert_eq!(
+            fs::read_to_string(room_dir.join(OWNER_RULES_FILE))
+                .await
+                .unwrap(),
+            generated
+        );
+        assert_eq!(local.files.get(OWNER_RULES_FILE), Some(&generated));
+        assert!(!copied.iter().any(|name| name == OWNER_RULES_FILE));
+        // Other server library documents still flow down exactly as before.
+        assert!(copied.iter().any(|name| name == "library/server-method.md"));
+        assert_eq!(
+            fs::read_to_string(room_dir.join("library/server-method.md"))
+                .await
+                .unwrap(),
+            "# Server method"
+        );
+        assert!(conflicts.is_empty());
     }
 
     #[tokio::test]
